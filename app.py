@@ -17,26 +17,41 @@ ETF_DICT = {
     "00929 復華台灣科技優息": "00929.TW"
 }
 
-# 3. 資料抓取函數 (加入快取機制，避免每次點擊都重新下載)
+# 3. 資料抓取函數 (加入快取機制與防呆處理)
 @st.cache_data(ttl=3600) # 快取 1 小時
 def load_etf_data(tickers, start_date, end_date):
     if not tickers:
         return pd.DataFrame()
     
-    # 下載歷史資料
-    data = yf.download(tickers, start=start_date, end=end_date)
-    
-    # 取出「還原收盤價 (Adj Close)」，這代表含息總報酬
-    if len(tickers) == 1:
-        # 如果只有一檔，yfinance 回傳的結構不同，需要處理
-        adj_close = data[['Adj Close']]
-        adj_close.columns = tickers
-    else:
-        adj_close = data['Adj Close']
+    df_dict = {}
+    for ticker in tickers:
+        # 一檔一檔抓取，避免 yfinance 多檔下載時的 MultiIndex 結構錯亂
+        data = yf.download(ticker, start=start_date, end=end_date, progress=False)
         
-    # 處理缺失值 (例如某些新發行的 ETF 早期沒有資料)
-    adj_close = adj_close.fillna(method='ffill').dropna()
-    return adj_close
+        if data.empty:
+            continue
+            
+        # 兼容 yfinance 新舊版本：如果是多層次索引，強制壓平取第一層
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+            
+        # 優先取 'Adj Close' (還原收盤價)，若新版 yfinance 預設調整則改取 'Close'
+        if 'Adj Close' in data.columns:
+            # 存入字典，並將該欄位重新命名為 ETF 代碼
+            df_dict[ticker] = data['Adj Close']
+        elif 'Close' in data.columns:
+            df_dict[ticker] = data['Close']
+            
+    # 如果都沒抓到資料，回傳空表
+    if not df_dict:
+        return pd.DataFrame()
+        
+    # 將所有 ETF 資料合併為單一 DataFrame
+    adj_close_df = pd.DataFrame(df_dict)
+    
+    # 處理缺失值
+    adj_close_df = adj_close_df.ffill().dropna()
+    return adj_close_df
 
 # 4. 側邊欄控制面板
 with st.sidebar:
