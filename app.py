@@ -183,9 +183,13 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
     
     rebalance_status = "開啟" if enable_rebalance and leverage_pct > 0 else "關閉"
     
+    # 【Bug修復】總資產公式修正為: 淨資產 + 負債 (確保會計恆等式)
+    final_net_real = traj_df['Net_Real'].iloc[-1]
+    final_total_assets = final_net_real + debt_real
+    
     return {
-        "期末淨資產(萬)": f"{traj_df['Net_Real'].iloc[-1] / 10000:.2f}",
-        "期末總資產(萬)": f"{(val_real) / 10000:.2f}",
+        "期末淨資產(萬)": f"{final_net_real / 10000:.2f}",
+        "期末總資產(萬)": f"{final_total_assets / 10000:.2f}",
         "理論含息年化(%)": f"{cagr_theory * 100:.2f}",
         "真實淨資產年化(%)": f"{cagr_real * 100:.2f}",
         "單純價差年化(%)": f"{cagr_static * 100:.2f}",
@@ -318,12 +322,26 @@ if selected_names:
             comparison_df = pd.DataFrame(display_data).set_index("標的名稱")
             comparison_df = comparison_df[[c for c in ordered_cols if c in comparison_df.columns]]
             
+            # 【提示字典】加入表頭 Hover Tooltip
+            TOOLTIPS = {
+                "動態擴張": "是否開啟CLEC策略：維持率超標時自動借款買入資產",
+                "最低維持率": "評估抗斷頭能力。歷史回測中遭遇最差狀況時的維持率 (低於130%將斷頭)",
+                "期末淨資產(萬)": "扣除質押負債後的真實身價",
+                "期末總資產(萬)": "期末淨資產 + 期末質押負債餘額",
+                "理論含息年化(%)": "假設不提領生活費，配息100%全額再投入的烏托邦極限報酬率",
+                "真實淨資產年化(%)": "BBD策略真實帳戶：扣除生活費與利息，餘額買股、不足借款的淨身價成長率",
+                "單純價差年化(%)": "對照基準：假設股數永遠不變(配息剛好抵銷提領)，單純由股價上漲帶來的報酬率",
+                "夏普值": "衡量承受每單位風險所獲得的超額報酬 (以真實軌跡計算)，數值越高越好",
+                "配息 CV": "配息變異係數 (標準差÷平均值)。越接近0代表歷年配息金額越平穩"
+            }
+            
             def render_html_table(df):
                 html = "<table style='width:100%; text-align:center; border-collapse: collapse; font-family: sans-serif; font-size: 0.85em;'>"
                 html += "<tr style='background-color: #1E1E1E; border-bottom: 2px solid #444;'>"
                 html += f"<th style='padding: 6px; text-align:left;'>標的名稱</th>"
                 for col in df.columns:
-                    html += f"<th style='padding: 6px; text-align:center;'>{col}</th>"
+                    tooltip = TOOLTIPS.get(col, "")
+                    html += f"<th style='padding: 6px; text-align:center;' title='{tooltip}'>{col}</th>"
                 html += "</tr>"
                 for index, row in df.iterrows():
                     bg_color, font_weight, color = "transparent", "normal", "#E0E0E0"
@@ -341,6 +359,17 @@ if selected_names:
 
             st.markdown(render_html_table(comparison_df), unsafe_allow_html=True)
             
+            # 績效指標說明面板
+            with st.expander("📊 績效指標說明辭典 (點擊展開)", expanded=False):
+                st.markdown("""
+                * **最低維持率**：遭遇歷史股災最差狀況時的維持率。小於 130% 代表策略失敗已遭券商斷頭。
+                * **理論含息年化 (%)**：假設完全不需要提領生活費，配息 100% 瘋狂再投入的「烏托邦極限報酬率」。
+                * **真實淨資產年化 (%)**：**核心指標！** BBD 帳戶真實運作：自動扣除生活費/利息，餘額買股、不足借款的真實身價成長率。
+                * **單純價差年化 (%)**：對照組：假設股數永遠凍結不變，純粹靠底層資產漲跌的報酬率。若真實淨資產 > 單純價差，代表你的現金流為正向循環。
+                * **夏普值**：衡量每單位風險的超額報酬 (CP值)，數值越高代表承擔相同波動能換取更多報酬。
+                * **配息 CV**：配息變異係數 (標準差÷平均值)，越接近 0 代表配息金額越平穩，越適合做為 Beta 帳戶核心。
+                """)
+
             # --- 批次刪除面板 ---
             if st.session_state.saved_portfolios:
                 st.write("")
@@ -360,7 +389,6 @@ if selected_names:
                                 st.session_state.saved_portfolios.pop(idx)
                             st.rerun()
 
-            st.caption("💡 **真實淨資產**為BBD運作結果：配息支付生活費與利息，餘額自動買入配息資產，不足額直接轉化為負債，絕不賣股。")
             st.divider()
 
             st.subheader("📈 競技場：所有儲存組合的真實淨資產比較")
