@@ -15,10 +15,11 @@ st.title("🛡️ 台灣高股息 ETF 現金流組合與質押模擬器")
 # 初始化 session_state
 if 'saved_portfolios' not in st.session_state:
     st.session_state.saved_portfolios = []
-if 'portfolio_counter' not in st.session_state:
-    st.session_state.portfolio_counter = 0
+if 'custom_etfs' not in st.session_state:
+    st.session_state.custom_etfs = {} # 用來存儲使用者自訂的新增 ETF
 
-ETF_DICT = {
+# 預設的 ETF 字典
+DEFAULT_ETF_DICT = {
     "0056 元大高股息": "0056.TW",
     "00878 國泰永續高股息": "00878.TW",
     "00919 群益台灣精選高息": "00919.TW",
@@ -31,7 +32,6 @@ ETF_DICT = {
 # ==========================================
 @st.cache_data(ttl=3600)
 def load_etf_data(tickers, start_date, end_date):
-    """抓取含息(Close)與不含息(Price)報價"""
     if not tickers: return pd.DataFrame(), pd.DataFrame()
     adj_dict, price_dict = {}, {}
     for ticker in tickers:
@@ -55,10 +55,9 @@ def load_etf_data(tickers, start_date, end_date):
 
 @st.cache_data(ttl=3600)
 def load_dividend_data(tickers):
-    """抓取配息紀錄"""
-    if not tickers: return pd.DataFrame(), pd.Series()
+    if not tickers: return pd.DataFrame(), {}
     div_dict = {}
-    div_raw_dict = {} # 保存原始除息日與金額用於填息計算
+    div_raw_dict = {} 
     for ticker in tickers:
         try:
             tk = yf.Ticker(ticker)
@@ -76,25 +75,24 @@ def calculate_mdd(cum_returns):
     running_max = cum_returns.cummax()
     return ((cum_returns - running_max) / running_max).min()
 
-def calculate_fill_rate(div_series, price_df, ticker):
-    """計算填息成功率與平均天數"""
-    if div_series is None or ticker not in div_series or ticker not in price_df.columns:
+def calculate_fill_rate(div_series_dict, price_series, ticker):
+    """計算填息成功率與平均天數。修正了原本 Series 操作錯誤的 Bug"""
+    if div_series_dict is None or ticker not in div_series_dict or price_series is None or price_series.empty:
         return "N/A", "N/A"
     
-    divs = div_series[ticker]
-    prices = price_df[ticker]
+    divs = div_series_dict[ticker]
     success_count = 0
     total_days = 0
     valid_divs = 0
     
     for ex_date, div_amount in divs.items():
         # 尋找除息日前一天的收盤價
-        pre_ex_dates = prices.index[prices.index < ex_date]
+        pre_ex_dates = price_series.index[price_series.index < ex_date]
         if pre_ex_dates.empty: continue
-        pre_ex_price = prices.loc[pre_ex_dates[-1]]
+        pre_ex_price = price_series.loc[pre_ex_dates[-1]]
         
         # 尋找除息日之後的價格走勢
-        post_ex_prices = prices[prices.index >= ex_date]
+        post_ex_prices = price_series[price_series.index >= ex_date]
         if post_ex_prices.empty: continue
         
         # 判斷是否填息 (價格 >= 除息前一天價格)
@@ -114,72 +112,55 @@ def calculate_fill_rate(div_series, price_df, ticker):
 # ==========================================
 # 3. 核心指標與資產軌跡運算
 # ==========================================
-def calculate_metrics_and_trajectory(adj_returns, price_returns, name, leverage_pct, div_series, price_series, borrow_rate, initial_capital, annual_expense, div_raw, is_preview=False):
-    """計算指標並模擬真實提領軌跡"""
+def calculate_metrics_and_trajectory(adj_returns, price_returns, name, leverage_pct, div_series, price_series, borrow_rate, initial_capital, annual_expense, div_raw_dict, ticker_for_fill_rate=None, is_preview=False):
     lev_ratio = leverage_pct / 100.0
     daily_borrow_rate = borrow_rate / 252
     
-    # 組合日報酬 (不含息，純價差)
     lev_price_returns = price_returns * (1 + lev_ratio) - (daily_borrow_rate * lev_ratio)
     
-    # --- 模擬真實資產軌跡 ---
-    # 起始總資產 = 本金 + 借款
+    # 模擬真實資產軌跡
     total_assets = initial_capital * (1 + lev_ratio)
     debt = initial_capital * lev_ratio
     net_assets = initial_capital
     
     trajectory = []
     current_year = -1
-    yearly_div_pool = 0
-    
-    # 假設這是一個合成的 ETF 組合，我們用加權平均的配息率來模擬每日/每年的配息發放
-    # 為了簡化，我們在每年年底進行一次生活費結算與再投入
     
     for date, ret in lev_price_returns.items():
         year = date.year
         if year != current_year:
-            # 跨年結算 (提領生活費或再投入)
             if current_year != -1:
-                # 取得該年配息總額 (若有資料)
                 if div_series is not None and current_year in div_series.index:
                     yield_amount = div_series.loc[current_year]
-                    p_year = price_series[price_series.index.year == current_year]
+                    p_year = price_series[price_series.index.year == current_year] if price_series is not None else pd.Series()
                     if not p_year.empty:
-                        # 估算該年實際配息金額
                         actual_div_yield = yield_amount / p_year.mean()
                         cash_received = net_assets * actual_div_yield * (1 + lev_ratio)
-                        
-                        # 扣除利息
                         interest_paid = debt * borrow_rate
                         net_cash = cash_received - interest_paid
                         
-                        # 提領生活費
                         if net_cash >= annual_expense:
-                            # 配息有剩，再投入本金
                             reinvest_amount = net_cash - annual_expense
                             total_assets += reinvest_amount
                             net_assets += reinvest_amount
                         else:
-                            # 配息不夠，變賣資產補足
                             shortfall = annual_expense - net_cash
                             total_assets -= shortfall
                             net_assets -= shortfall
-                            
             current_year = year
             
-        # 每日資產隨市場波動
         total_assets = total_assets * (1 + ret)
         net_assets = total_assets - debt
         trajectory.append({'Date': date, 'Net_Assets': net_assets})
         
     traj_df = pd.DataFrame(trajectory).set_index('Date')
     
-    # --- 計算其他指標 ---
-    cagr_adj = ((1 + adj_returns).prod() ** (252 / len(adj_returns))) - 1
-    cagr_price = ((1 + price_returns).prod() ** (252 / len(price_returns))) - 1
-    volatility = adj_returns.std() * np.sqrt(252)
+    # 計算指標
+    cagr_adj = ((1 + adj_returns).prod() ** (252 / len(adj_returns))) - 1 if not adj_returns.empty else 0
+    cagr_price = ((1 + price_returns).prod() ** (252 / len(price_returns))) - 1 if not price_returns.empty else 0
+    volatility = adj_returns.std() * np.sqrt(252) if not adj_returns.empty else 0
     sharpe_ratio = (cagr_adj - 0.015) / volatility if volatility != 0 else 0
-    mdd = calculate_mdd((1 + adj_returns).cumprod())
+    mdd = calculate_mdd((1 + adj_returns).cumprod()) if not adj_returns.empty else 0
     
     cv_str = "N/A"
     yield_val = "N/A"
@@ -203,10 +184,9 @@ def calculate_metrics_and_trajectory(adj_returns, price_returns, name, leverage_
                 final_yield = base_yield * (1 + lev_ratio) - (borrow_rate * lev_ratio)
                 yield_val = f"{final_yield * 100:.2f}"
                 
-    # 若是單一 ETF，計算填息資料
-    if name in ETF_DICT.keys():
-        ticker = ETF_DICT[name]
-        fill_rate_str, fill_days_str = calculate_fill_rate(div_raw, price_series, ticker)
+    # 若提供 ticker_for_fill_rate，則計算單一 ETF 填息資料
+    if ticker_for_fill_rate:
+        fill_rate_str, fill_days_str = calculate_fill_rate(div_raw_dict, price_series, ticker_for_fill_rate)
                 
     metrics = {
         "id": f"id_{datetime.now().timestamp()}" if not is_preview else "preview",
@@ -243,7 +223,21 @@ with st.sidebar:
     st.divider()
     
     st.header("⚖️ 3. 資產與權重")
-    selected_names = st.multiselect("選擇組成 ETF", list(ETF_DICT.keys()), default=["00713 元大台灣高息低波", "00878 國泰永續高股息"])
+    
+    # 組合完整的 ETF 字典 (預設 + 自訂)
+    current_etf_dict = {**DEFAULT_ETF_DICT, **st.session_state.custom_etfs}
+    
+    # 新增自訂 ETF 的功能
+    with st.expander("➕ 新增自訂 ETF"):
+        new_etf_code = st.text_input("輸入台股代碼 (例: 006208)")
+        new_etf_name = st.text_input("輸入顯示名稱 (例: 006208 富邦台50)")
+        if st.button("新增標的"):
+            if new_etf_code and new_etf_name:
+                ticker_symbol = f"{new_etf_code}.TW" if not new_etf_code.endswith(".TW") else new_etf_code
+                st.session_state.custom_etfs[new_etf_name] = ticker_symbol
+                st.rerun()
+                
+    selected_names = st.multiselect("選擇組成 ETF", list(current_etf_dict.keys()), default=["00713 元大台灣高息低波", "00878 國泰永續高股息"])
     
     weights = []
     if selected_names:
@@ -265,7 +259,7 @@ if selected_names:
     if sum(weights) != 1.0:
         st.error(f"⚠️ 目前權重總和為 {sum(weights)*100:.0f}%，請調整至 100%。")
     else:
-        selected_tickers = [ETF_DICT[name] for name in selected_names]
+        selected_tickers = [current_etf_dict[name] for name in selected_names]
         with st.spinner("載入報價與配息模型中..."):
             df_adj, df_price = load_etf_data(selected_tickers, start_date, end_date)
             df_div_annual, df_div_raw = load_dividend_data(selected_tickers)
@@ -303,25 +297,22 @@ if selected_names:
             # --- 績效比較表 ---
             st.subheader("📋 績效比較表")
             
-            # 準備顯示資料
             display_data = []
             
             # 1. 單一 ETF
             for col in adj_returns.columns:
-                etf_name = [k for k, v in ETF_DICT.items() if v == col][0]
+                etf_name = [k for k, v in current_etf_dict.items() if v == col][0]
                 etf_div_series = df_div_annual[col] if col in df_div_annual.columns else None
                 etf_price_series = df_adj[col]
-                m, _ = calculate_metrics_and_trajectory(adj_returns[col], price_returns[col], etf_name, 0, etf_div_series, etf_price_series, borrow_rate, initial_capital, annual_expense, df_div_raw)
-                m.pop('id', None) # 移除不必要的內部 id
+                # 傳入 ticker_for_fill_rate 來啟動填息計算
+                m, _ = calculate_metrics_and_trajectory(adj_returns[col], price_returns[col], etf_name, 0, etf_div_series, etf_price_series, borrow_rate, initial_capital, annual_expense, df_div_raw, ticker_for_fill_rate=col)
+                m.pop('id', None)
                 display_data.append(m)
                 
-            # 2. 歷史紀錄與刪除功能
+            # 2. 歷史紀錄
             for idx, item in enumerate(st.session_state.saved_portfolios):
                 m = item['metrics'].copy()
-                item_id = m.pop('id', None)
-                
-                # 這裡使用 st.columns 來並排顯示刪除按鈕與資料 (僅為示意，更優雅的作法是直接渲染 HTML 表格並綁定 JS，但在 Streamlit 中較難實作)
-                # 我們退而求其次，在總表下方提供一個下拉選單來刪除特定紀錄
+                m.pop('id', None)
                 display_data.append(m)
                 
             # 3. 當前預覽
@@ -337,11 +328,11 @@ if selected_names:
             comparison_df = pd.DataFrame(display_data).set_index("標的名稱")
             
             def render_html_table(df):
-                html = "<table style='width:100%; text-align:center; border-collapse: collapse; font-family: sans-serif; font-size: 0.9em;'>"
+                html = "<table style='width:100%; text-align:center; border-collapse: collapse; font-family: sans-serif; font-size: 0.85em;'>"
                 html += "<tr style='background-color: #1E1E1E; border-bottom: 2px solid #444;'>"
-                html += f"<th style='padding: 8px; text-align:left;'>標的名稱</th>"
+                html += f"<th style='padding: 6px; text-align:left;'>標的名稱</th>"
                 for col in df.columns:
-                    html += f"<th style='padding: 8px; text-align:center;'>{col}</th>"
+                    html += f"<th style='padding: 6px; text-align:center;'>{col}</th>"
                 html += "</tr>"
                 for index, row in df.iterrows():
                     bg_color = "transparent"
@@ -357,9 +348,9 @@ if selected_names:
                         color = "#D5D8DC"
                     
                     html += f"<tr style='background-color: {bg_color}; border-bottom: 1px solid #333;'>"
-                    html += f"<td style='padding: 8px; text-align:left; color:{color}; font-weight:{font_weight};'>{index}</td>"
+                    html += f"<td style='padding: 6px; text-align:left; color:{color}; font-weight:{font_weight};'>{index}</td>"
                     for item in row:
-                        html += f"<td style='padding: 8px; text-align:center; color:{color}; font-weight:{font_weight};'>{item}</td>"
+                        html += f"<td style='padding: 6px; text-align:center; color:{color}; font-weight:{font_weight};'>{item}</td>"
                     html += "</tr>"
                 html += "</table>"
                 return html
@@ -371,11 +362,13 @@ if selected_names:
                 st.write("")
                 del_col1, del_col2 = st.columns([3, 1])
                 with del_col1:
-                    options = [f"{i}: {p['metrics']['標的名稱']}" for i, p in enumerate(st.session_state.saved_portfolios)]
-                    selected_del = st.selectbox("選擇要刪除的紀錄", options, label_visibility="collapsed")
+                    options = [f"第 {i+1} 筆: {p['metrics']['標的名稱']}" for i, p in enumerate(st.session_state.saved_portfolios)]
+                    selected_del = st.selectbox("選擇要刪除的歷史紀錄", options, label_visibility="collapsed")
                 with del_col2:
-                    if st.button("🗑️ 刪除選取紀錄", use_container_width=True):
-                        idx_to_del = int(selected_del.split(":")[0])
+                    if st.button("🗑️ 刪除選取的紀錄", use_container_width=True):
+                        # 解析出 index 並刪除
+                        idx_str = selected_del.split(":")[0].replace("第 ", "").replace(" 筆", "")
+                        idx_to_del = int(idx_str) - 1
                         st.session_state.saved_portfolios.pop(idx_to_del)
                         st.rerun()
 
@@ -385,9 +378,7 @@ if selected_names:
             # --- 資金曲線雙圖表 ---
             st.subheader("📈 真實提領軌跡預覽 (包含再投入與變賣本金)")
             
-            # 這裡繪製的是加入生活費提領邏輯後的 "淨資產" 曲線
             fig_traj = go.Figure()
-            # 為了避免 ID 衝突，我們在繪圖時不指定硬體 ID，Plotly 會自動處理
             fig_traj.add_trace(go.Scatter(x=curr_p_t.index, y=curr_p_t['Net_Assets'], mode='lines', name='🎯 當前組合淨資產 (未槓桿)', line=dict(color='#2E86C1', width=2)))
             if leverage_pct > 0:
                 fig_traj.add_trace(go.Scatter(x=curr_l_t.index, y=curr_l_t['Net_Assets'], mode='lines', name=f'🔥 當前組合淨資產 (質押 {leverage_pct}%)', line=dict(color='#E74C3C', width=2)))
@@ -398,7 +389,6 @@ if selected_names:
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
             )
             
-            # 使用唯一的 key 參數來避免 duplicate ID error
             st.plotly_chart(fig_traj, use_container_width=True, key="traj_chart_main")
             st.info(f"👆 這張圖展示了在每年需提領 **{annual_expense} 元**生活費的壓力下，你的淨資產是持續成長（配息 > 生活費，自動再投入）還是逐漸枯竭（配息不足，被迫變賣本金）。")
                 
