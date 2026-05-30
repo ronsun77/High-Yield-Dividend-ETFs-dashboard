@@ -33,9 +33,13 @@ DEFAULT_ETF_DICT = {
 @st.cache_data(ttl=3600)
 def load_raw_data(tickers, start_date, end_date):
     if not tickers: return pd.DataFrame(), {}
+    
+    # 強制加入大盤指數 ^TWII 以計算 Beta 與市場回撤
+    fetch_list = list(set(tickers + ['^TWII']))
+    
     raw_prices = {}
     div_raw_dict = {}
-    for ticker in tickers:
+    for ticker in fetch_list:
         try:
             df = yf.download(ticker, start=start_date, end=end_date, progress=False, auto_adjust=False)
             if not df.empty:
@@ -45,14 +49,41 @@ def load_raw_data(tickers, start_date, end_date):
                     df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
                     raw_prices[ticker] = df['Close']
             
-            tk = yf.Ticker(ticker)
-            divs = tk.dividends
-            if not divs.empty:
-                divs.index = pd.to_datetime(divs.index).tz_localize(None).normalize()
-                div_raw_dict[ticker] = divs[(divs.index >= pd.Timestamp(start_date)) & (divs.index <= pd.Timestamp(end_date))]
+            # 大盤不計配息
+            if ticker != '^TWII':
+                tk = yf.Ticker(ticker)
+                divs = tk.dividends
+                if not divs.empty:
+                    divs.index = pd.to_datetime(divs.index).tz_localize(None).normalize()
+                    div_raw_dict[ticker] = divs[(divs.index >= pd.Timestamp(start_date)) & (divs.index <= pd.Timestamp(end_date))]
         except Exception:
             continue
+            
     return pd.DataFrame(raw_prices).dropna(), div_raw_dict
+
+def get_beta_and_market_mdd(tickers, weights, df_price, market_ticker='^TWII'):
+    """計算組合的原型 Beta 值與大盤同期的最大回撤"""
+    if market_ticker not in df_price.columns or not tickers:
+        return 1.0, 0.0
+    
+    aligned_df = df_price[tickers + [market_ticker]].dropna()
+    if aligned_df.empty or len(aligned_df) < 2: 
+        return 1.0, 0.0
+        
+    returns = aligned_df.pct_change().dropna()
+    port_returns = returns[tickers].dot(weights)
+    market_returns = returns[market_ticker]
+    
+    # 計算 Beta
+    cov_matrix = np.cov(port_returns, market_returns)
+    beta = cov_matrix[0, 1] / cov_matrix[1, 1] if cov_matrix[1, 1] != 0 else 1.0
+    
+    # 計算大盤 MDD
+    cum_market = (1 + market_returns).cumprod()
+    running_max = cum_market.cummax()
+    market_mdd = ((cum_market - running_max) / running_max).min()
+    
+    return beta, market_mdd
 
 def calculate_fill_rate(div_series_dict, price_series, ticker):
     if div_series_dict is None or ticker not in div_series_dict or price_series is None or price_series.empty:
@@ -144,9 +175,12 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
     else:
         target_margin_ratio = (total_initial_assets / initial_debt) if initial_debt > 0 else float('inf')
     
-    shares_theory = {t: (total_initial_assets * weights[i]) / df_price[t].iloc[0] for i, t in enumerate(df_price.columns)}
+    # 確保傳入的 df_price 只包含我們要模擬的標的 (排除大盤)
+    tickers = [c for c in df_price.columns if c != '^TWII']
+    
+    shares_theory = {t: (total_initial_assets * weights[i]) / df_price[t].iloc[0] for i, t in enumerate(tickers)}
     debt_theory = initial_debt
-    shares_real = {t: (total_initial_assets * weights[i]) / df_price[t].iloc[0] for i, t in enumerate(df_price.columns)}
+    shares_real = {t: (total_initial_assets * weights[i]) / df_price[t].iloc[0] for i, t in enumerate(tickers)}
     debt_real = initial_debt
     shares_static = shares_real.copy()
     
@@ -156,7 +190,6 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
     
     trajectory = []
     current_year = -1
-    tickers = df_price.columns
     
     for date, prices in df_price.iterrows():
         yearly_expense_accrued += annual_expense / 252
@@ -321,40 +354,9 @@ with st.sidebar:
     if leverage_pct > 0:
         enable_rebalance = st.checkbox("⚙️ 恆定維持率策略", value=False, help="每年底檢視：維持率超過設定值時，增加質押借款買入資產；低於設定值時，不做任何動作(絕不賣股)。")
 
-    # --- 新增：AI 尋優防禦底線設定 ---
     st.divider()
     st.header("🎯 5. AI 尋優防禦底線設定")
-    ai_min_margin = st.number_input("股災最低容許維持率 (%)", min_value=140, max_value=500, value=250, step=10, help="設定 AI 尋優的嚴格底線。歷史回測中若維持率跌破此數值，AI 將直接淘汰該策略。建議設定 >200% 以保留安全距離，避免「走鋼索」。")
-
-    st.divider()
-    st.header("🛡️ 戰略評估與大盤容許跌幅試算")
-    if leverage_pct > 0:
-        debt_amt = initial_capital * (leverage_pct / 100)
-        total_amt = initial_capital + debt_amt
-        
-        drop_to_166 = (1 - (1.66 * debt_amt) / total_amt) * 100
-        drop_to_130 = (1 - (1.30 * debt_amt) / total_amt) * 100
-        
-        annual_interest = debt_amt * (borrow_rate / 100)
-        total_liability = annual_expense + annual_interest
-        breakeven_yield = (total_liability / total_amt) * 100
-        
-        est_beta = 0.8 
-        market_drop_130 = drop_to_130 / est_beta
-        
-        st.info(f"""
-        **🚨 本組合最大容許跌幅**
-        * 組合淨值跌 **-{drop_to_166:.1f}%** 將面臨追繳 (166%)
-        * 組合淨值跌 **-{drop_to_130:.1f}%** 將遭斷頭 (130%)
-        
-        *(若假設組合 Beta 為 {est_beta}，代表**大盤需崩跌約 -{market_drop_130:.1f}%** 才會讓您的組合跌到斷頭線)*
-        
-        **⚖️ 損平殖利率安全檢測**
-        * 每年提領與利息總需：{(total_liability)/10000:.1f} 萬
-        * 總資產需有 **{breakeven_yield:.2f}%** 殖利率才能不傷本。
-        """)
-    else:
-        st.info("無質押，資產絕對安全 (無斷頭風險)。\n* 但需承擔股息不足時變賣本金的風險。")
+    ai_min_margin = st.number_input("股災最低容許維持率 (%)", min_value=140, max_value=500, value=250, step=10, help="歷史回測中若維持率跌破此數值，AI 將淘汰該策略。建議 >200% 以保證安穩好眠。")
 
 # ==========================================
 # 5. 主畫面運算與渲染
@@ -375,9 +377,43 @@ if selected_names:
             actual_end = df_price.index[-1].strftime('%Y-%m-%d')
             
             selected_tickers = [current_etf_dict[name] for name in selected_names]
+            
+            # --- 取得動態 Beta 與大盤回撤 ---
+            port_beta, market_mdd = get_beta_and_market_mdd(selected_tickers, weights, df_price)
             port_yield_no_lev, port_yield_lev, port_cv, raw_port_yield = get_portfolio_yield_cv(selected_tickers, df_price, div_raw_dict, weights, leverage_pct, borrow_rate)
             
-            st.subheader("📊 預估首年現金流健康度 (以歷史平均殖利率估算)")
+            # --- 渲染側邊欄戰略評估 (加入大盤 Beta) ---
+            with st.sidebar:
+                st.divider()
+                st.header("🛡️ 戰略評估與大盤連動試算")
+                if leverage_pct > 0:
+                    debt_amt = initial_capital * (leverage_pct / 100)
+                    total_amt = initial_capital + debt_amt
+                    
+                    drop_to_166 = (1 - (1.66 * debt_amt) / total_amt) * 100
+                    drop_to_130 = (1 - (1.30 * debt_amt) / total_amt) * 100
+                    
+                    annual_interest = debt_amt * (borrow_rate / 100)
+                    total_liability = annual_expense + annual_interest
+                    breakeven_yield = (total_liability / total_amt) * 100
+                    
+                    market_drop_130 = drop_to_130 / port_beta if port_beta > 0 else 0
+                    
+                    st.info(f"""
+                    **🚨 組合斷頭防禦力 (組合 Beta: {port_beta:.2f})**
+                    * 組合淨值跌 **-{drop_to_166:.1f}%** 面臨追繳 (166%)
+                    * 組合淨值跌 **-{drop_to_130:.1f}%** 面臨斷頭 (130%)
+                    
+                    *(根據您的 ETF 歷史防禦力換算，**台股大盤需崩跌約 -{market_drop_130:.1f}%** 才會讓您的帳戶觸及斷頭)*
+                    
+                    **⚖️ 損平殖利率安全檢測**
+                    * 每年提領與利息總需：{(total_liability)/10000:.1f} 萬
+                    * 總資產需有 **{breakeven_yield:.2f}%** 殖利率才能不傷本。
+                    """)
+                else:
+                    st.info(f"無質押，無斷頭風險。\n* 目前組合 Beta 值：{port_beta:.2f} (大盤連動度)")
+
+            st.subheader(f"📊 預估首年現金流健康度 (以歷史平均殖利率估算)")
             if leverage_pct > 0:
                 est_div = (initial_capital * (1 + leverage_pct/100)) * raw_port_yield
                 est_interest = (initial_capital * (leverage_pct/100)) * (borrow_rate / 100)
@@ -437,7 +473,9 @@ if selected_names:
                 if col in df_price.columns:
                     etf_name = [k for k, v in current_etf_dict.items() if v == col][0]
                     m, _, _ = run_simulation(df_price[[col]], div_raw_dict, [1.0], initial_capital, 0, borrow_rate, annual_expense, False)
-                    m.update({"標的名稱": etf_name, "質押": "0%", "恆定維持率": "-"})
+                    s_beta, _ = get_beta_and_market_mdd([col], [1.0], df_price)
+                    
+                    m.update({"標的名稱": etf_name, "質押": "0%", "組合 Beta": f"{s_beta:.2f}", "恆定維持率": "-"})
                     
                     fill_rate, fill_days, cv_str, yield_str = "-", "-", "-", "-"
                     if col in div_raw_dict and not div_raw_dict[col].empty:
@@ -463,9 +501,12 @@ if selected_names:
                     )
                     
                     y_no_lev, y_lev, cv, _ = get_portfolio_yield_cv(s_tickers, df_price, div_raw_dict, s_weights, strat['leverage_pct'], borrow_rate)
+                    s_beta, _ = get_beta_and_market_mdd(s_tickers, s_weights, df_price)
+                    
                     m.update({
                         "標的名稱": strat['name'],
                         "質押": f"{strat['leverage_pct']}%" if strat['leverage_pct'] > 0 else "0%",
+                        "組合 Beta": f"{s_beta:.2f}",
                         "年化配息率(%)": y_lev if strat['leverage_pct'] > 0 else y_no_lev,
                         "填息成功率": "-",
                         "平均填息天數": "-",
@@ -475,19 +516,20 @@ if selected_names:
                     strat['computed_traj'] = t_df 
                 
             curr_p_m, curr_p_t, _ = run_simulation(df_price[selected_tickers], div_raw_dict, weights, initial_capital, 0, borrow_rate, annual_expense, False)
-            curr_p_m.update({"標的名稱": f"👁️ 預覽: {custom_name} (無質押)", "質押": "0%", "恆定維持率": "-", "年化配息率(%)": port_yield_no_lev, "填息成功率": "-", "平均填息天數": "-", "配息 CV": port_cv})
+            curr_p_m.update({"標的名稱": f"👁️ 預覽: {custom_name} (無質押)", "質押": "0%", "組合 Beta": f"{port_beta:.2f}", "恆定維持率": "-", "年化配息率(%)": port_yield_no_lev, "填息成功率": "-", "平均填息天數": "-", "配息 CV": port_cv})
             display_data.append(curr_p_m)
             
             if leverage_pct > 0:
                 curr_l_m, curr_l_t, _ = run_simulation(df_price[selected_tickers], div_raw_dict, weights, initial_capital, leverage_pct, borrow_rate, annual_expense, enable_rebalance, target_margin)
-                curr_l_m.update({"標的名稱": f"👁️ 預覽: {custom_name} (質押)", "質押": f"{leverage_pct}%", "恆定維持率": "開啟" if enable_rebalance else "關閉", "年化配息率(%)": port_yield_lev, "填息成功率": "-", "平均填息天數": "-", "配息 CV": port_cv})
+                curr_l_m.update({"標的名稱": f"👁️ 預覽: {custom_name} (質押)", "質押": f"{leverage_pct}%", "組合 Beta": f"{port_beta:.2f}", "恆定維持率": "開啟" if enable_rebalance else "關閉", "年化配息率(%)": port_yield_lev, "填息成功率": "-", "平均填息天數": "-", "配息 CV": port_cv})
                 display_data.append(curr_l_m)
                 
-            ordered_cols = ["標的名稱", "質押", "恆定維持率", "最低維持率", "期末淨資產(萬)", "期末總資產(萬)", "理論含息年化(%)", "真實淨資產年化(%)", "單純價差年化(%)", "年化配息率(%)", "填息成功率", "平均填息天數", "年化波動率(%)", "最大回撤(%)", "理論夏普值", "真實夏普值", "配息 CV"]
+            ordered_cols = ["標的名稱", "質押", "組合 Beta", "恆定維持率", "最低維持率", "期末淨資產(萬)", "期末總資產(萬)", "理論含息年化(%)", "真實淨資產年化(%)", "單純價差年化(%)", "年化配息率(%)", "填息成功率", "平均填息天數", "年化波動率(%)", "最大回撤(%)", "理論夏普值", "真實夏普值", "配息 CV"]
             comparison_df = pd.DataFrame(display_data).set_index("標的名稱")
             comparison_df = comparison_df[[c for c in ordered_cols if c in comparison_df.columns]]
             
             TOOLTIPS = {
+                "組合 Beta": "此 ETF 組合相較於台股大盤的波動度 (低於 1 代表較抗跌)",
                 "恆定維持率": "是否開啟策略：維持率超標時自動借款買入資產",
                 "最低維持率": "評估抗斷頭能力。歷史回測中遭遇最差狀況時的維持率 (低於130%將斷頭)",
                 "期末淨資產(萬)": "已扣除此期間全部生活費、質押利息與剩餘負債後的真實身價",
@@ -495,7 +537,7 @@ if selected_names:
                 "理論含息年化(%)": "假設不提領生活費，配息100%全額再投入的極限報酬率",
                 "真實淨資產年化(%)": "BBD真實帳戶：扣生活費/利息，餘額買股、不足借款的淨身價成長率",
                 "單純價差年化(%)": "基準線：假設股數永遠不變(配息剛好抵銷提領)，單純由股價上漲的報酬",
-                "理論夏普值": "不考慮提領與借款利息，純粹資產本身的夏普值 (通常網站公布的數字)",
+                "理論夏普值": "不考慮提領與借款利息，純粹資產本身的夏普值 (代表原始體質)",
                 "真實夏普值": "扣除生活費與利息後，真實 BBD 帳戶的夏普值",
                 "配息 CV": "變異係數 (標準差÷平均值)。越接近0代表歷年配息金額越平穩"
             }
@@ -525,16 +567,13 @@ if selected_names:
             st.markdown(render_html_table(comparison_df), unsafe_allow_html=True)
             
             with st.expander("📊 績效指標說明辭典 (點擊展開)", expanded=False):
-                st.markdown("""
-                * **期末淨資產 (萬)**：這段期間內付清所有生活費、繳完所有質押利息、並結清剩餘負債後，你口袋裡真正剩下的錢。
-                * **期末總資產 (萬)**：期末淨資產 + 尚未還清的質押負債餘額（等同於你帳戶裡的股票總市值）。
+                st.markdown(f"""
+                * 📌 **基準對照：此區間內，台股大盤(^TWII)的最大歷史回撤為 {market_mdd*100:.2f}%**
+                * **組合 Beta**：測量資產防禦力的絕對指標。Beta = 0.7 代表大盤跌 10% 時，此組合原形通常只跌 7%。
+                * **最大回撤 (%)**：圖表上顯示的是**真實淨資產**的回撤。它包含了「ETF下跌 + 槓桿放大 + 提領抽血」的三重打擊，代表您帳戶真實經歷的最痛縮水幅度。
                 * **最低維持率**：遭遇歷史股災最差狀況時的維持率。小於 130% 代表策略失敗已遭券商斷頭。
-                * **理論含息年化 (%)**：假設完全不需要提領生活費，配息 100% 瘋狂再投入的「烏托邦極限報酬率」。
                 * **真實淨資產年化 (%)**：**核心指標！** BBD 帳戶真實運作：自動扣除生活費/利息，餘額買股、不足借款的真實身價成長率。
-                * **單純價差年化 (%)**：對照組：假設股數永遠凍結不變，純粹靠底層資產漲跌的報酬率。若真實淨資產 > 單純價差，代表你的現金流為正向循環。
-                * **理論夏普值**：不考慮提領與借款利息，純粹資產本身的夏普值 (通常網站公布的數字，代表原始體質)。
-                * **真實夏普值**：扣除生活費與利息後，承擔提領壓力下的真實 BBD 帳戶夏普值 (通常較低)。
-                * **配息 CV**：配息變異係數 (標準差÷平均值)，越接近 0 代表配息金額越平穩，越適合做為現金流核心。
+                * **理論夏普值** vs **真實夏普值**：前者代表資產原來的優劣；後者代表扛下提領壓力後，真實入袋的 CP 值。
                 """)
 
             if st.session_state.saved_portfolios:
@@ -622,7 +661,6 @@ if selected_names:
                     best_mdd_list = []
                     best_net_list = []
                     
-                    # 依據防禦底線動態調整測試網格，避免測試注定失敗的低維持率
                     margin_targets = [250, 300, 350, 400, 450, 500, 600, 800]
                     margin_targets = [m for m in margin_targets if m > ai_min_margin]
                     if not margin_targets: 
@@ -631,11 +669,11 @@ if selected_names:
                     leverage_targets = [round(100 / (m/100 - 1)) for m in margin_targets]
                     
                     for w in weight_grids:
+                        grid_beta, _ = get_beta_and_market_mdd(selected_tickers, w, df_price)
                         for idx, lev in enumerate(leverage_targets):
                             margin_target = margin_targets[idx]
                             _, _, raw = run_simulation(df_price[selected_tickers], div_raw_dict, w, initial_capital, lev, borrow_rate, annual_expense, True, margin_target)
                             
-                            # 核心防禦約束：利用使用者自訂的 ai_min_margin 篩選
                             if raw['min_maintenance'] >= ai_min_margin and raw['final_net_real'] > initial_capital:
                                 w_str = " + ".join([f"{name[:5]} {w[i]*100:.0f}%" for i, name in enumerate(selected_names) if w[i] > 0])
                                 result = {
@@ -646,7 +684,8 @@ if selected_names:
                                     "mdd": raw['mdd'],
                                     "net": raw['final_net_real'],
                                     "cagr": raw['cagr_real'],
-                                    "min_margin": raw['min_maintenance']
+                                    "min_margin": raw['min_maintenance'],
+                                    "beta": grid_beta
                                 }
                                 best_sharpe_list.append(result)
                                 best_mdd_list.append(result)
@@ -656,7 +695,7 @@ if selected_names:
                     best_mdd_list.sort(key=lambda x: x['mdd'], reverse=True) 
                     best_net_list.sort(key=lambda x: x['net'], reverse=True)
                     
-                    st.success(f"📊 **網格搜索完成！同期間基準：{actual_start} 至 {actual_end}**")
+                    st.success(f"📊 **網格搜索完成！同期間基準：{actual_start} 至 {actual_end}** (大盤最大回撤: {market_mdd*100:.2f}%)")
                     
                     if best_sharpe_list:
                         col_opt1, col_opt2, col_opt3 = st.columns(3)
@@ -666,21 +705,21 @@ if selected_names:
                             st.markdown("針對風控與獲利取得最佳平衡點的組合：")
                             for i, res in enumerate(best_sharpe_list[:3]):
                                 rank = ["❶ 冠軍", "❷ 亞軍", "❸ 季軍"][i]
-                                st.info(f"**{rank}：{res['w_str']}**\n* 策略：恆定維持率 **{res['margin']}%**\n* 成效：真實夏普 **{res['sharpe']:.2f}** / 回撤 **{res['mdd']*100:.2f}%**\n* 🛡️ 最低維持率：**{res['min_margin']:.0f}%** (距離斷頭線仍有充裕緩衝)")
+                                st.info(f"**{rank}：{res['w_str']}**\n* 組合 Beta：**{res['beta']:.2f}**\n* 策略：恆定維持率 **{res['margin']}%**\n* 成效：真實夏普 **{res['sharpe']:.2f}** / 回撤 **{res['mdd']*100:.2f}%**\n* 🛡️ 最低維持率：**{res['min_margin']:.0f}%**")
                         
                         with col_opt2:
                             st.subheader("🛡️ 絕對防禦 (最大回撤極小化)")
-                            st.markdown("不盲目追求高報酬，以極致抗震、安全存活為首要目標 (常為單一防禦資產)：")
+                            st.markdown("不盲目追求高報酬，以極致抗震、安全存活為首要目標：")
                             for i, res in enumerate(best_mdd_list[:3]):
                                 rank = ["❶ 冠軍", "❷ 亞軍", "❸ 季軍"][i]
-                                st.warning(f"**{rank}：{res['w_str']}**\n* 策略：恆定維持率 **{res['margin']}%**\n* 成效：極限回撤 **{res['mdd']*100:.2f}%** / 真實夏普 **{res['sharpe']:.2f}**\n* 🛡️ 最低維持率：**{res['min_margin']:.0f}%** (睡得最安穩)")
+                                st.warning(f"**{rank}：{res['w_str']}**\n* 組合 Beta：**{res['beta']:.2f}**\n* 策略：恆定維持率 **{res['margin']}%**\n* 成效：極限回撤 **{res['mdd']*100:.2f}%** / 真實夏普 **{res['sharpe']:.2f}**\n* 🛡️ 最低維持率：**{res['min_margin']:.0f}%**")
                         
                         with col_opt3:
                             st.subheader("🚀 暴力擴張 (期末資產最大化)")
                             st.markdown("在保證絕對不跌破防禦底線的前提下，榨出最高絕對財富：")
                             for i, res in enumerate(best_net_list[:3]):
                                 rank = ["❶ 冠軍", "❷ 亞軍", "❸ 季軍"][i]
-                                st.error(f"**{rank}：{res['w_str']}**\n* 策略：恆定維持率 **{res['margin']}%**\n* 成效：期末淨資產 **{res['net']/10000:.0f} 萬** / 年化 **{res['cagr']*100:.2f}%**\n* 🛡️ 最低維持率：**{res['min_margin']:.0f}%** (極限操作)")
+                                st.error(f"**{rank}：{res['w_str']}**\n* 組合 Beta：**{res['beta']:.2f}**\n* 策略：恆定維持率 **{res['margin']}%**\n* 成效：期末淨資產 **{res['net']/10000:.0f} 萬** / 年化 **{res['cagr']*100:.2f}%**\n* 🛡️ 最低維持率：**{res['min_margin']:.0f}%**")
                     else:
                         st.info(f"在目前的提領壓力與防禦底線 ({ai_min_margin}%) 下，系統無法找到保證存活且不傷本的組合。建議降低提領金額或調降防禦底線標準。")
             else:
