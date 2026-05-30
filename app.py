@@ -303,7 +303,8 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
 with st.sidebar:
     st.header("💰 1. 資金與提領設定 (全局連動)")
     initial_capital = st.number_input("初始本金 (元)", value=8000000, step=1000000)
-    annual_expense = st.number_input("每年生活費需求 (元)", value=600000, step=10000)
+    # 調整生活費需求預設值為 58 萬
+    annual_expense = st.number_input("每年生活費需求 (元)", value=580000, step=10000)
     st.divider()
     
     st.header("🕒 2. 回測時間區間")
@@ -323,7 +324,8 @@ with st.sidebar:
                 st.session_state.custom_etfs[new_etf_name] = ticker_symbol
                 st.rerun()
                 
-    selected_names = st.multiselect("選擇組成 ETF", list(current_etf_dict.keys()), default=["00713 元大台灣高息低波", "00878 國泰永續高股息"])
+    # 預設直接勾選 00713 / 0056 / 00878 三檔 ETF
+    selected_names = st.multiselect("選擇組成 ETF", list(current_etf_dict.keys()), default=["00713 元大台灣高息低波", "0056 元大高股息", "00878 國泰永續高股息"])
     weights = []
     if selected_names:
         default_w = 100 // len(selected_names)
@@ -400,7 +402,7 @@ if selected_names:
                     * 總資產需有 **{breakeven_yield:.2f}%** 殖利率才能不傷本。
                     """)
                 else:
-                    st.info(f"無質押，無斷頭風險。\n* 目前組合 Beta 值：{port_beta:.2f} (大盤連動度)")
+                    st.info(f"無質押，無斷頭風險。\n* 目前組合 Beta值：{port_beta:.2f} (大盤連動度)")
 
             st.subheader(f"📊 預估首年現金流健康度 (以歷史平均殖利率估算)")
             if leverage_pct > 0:
@@ -517,27 +519,12 @@ if selected_names:
             comparison_df = pd.DataFrame(display_data).set_index("標的名稱")
             comparison_df = comparison_df[[c for c in ordered_cols if c in comparison_df.columns]]
             
-            TOOLTIPS = {
-                "組合 Beta": "此 ETF 組合相較於台股大盤的波動度 (低於 1 代表較抗跌)",
-                "恆定維持率": "是否開啟策略：維持率超標時自動借款買入資產",
-                "最低維持率": "評估抗斷頭能力。歷史回測中遭遇最差狀況時的維持率 (低於130%將斷頭)",
-                "期末淨資產(萬)": "已扣除此期間全部生活費、質押利息與剩餘負債後的真實身價",
-                "期末總資產(萬)": "期末淨資產 + 期末質押負債餘額 (亦已反映提領扣除)",
-                "理論含息年化(%)": "假設不提領生活費，配息100%全額再投入的極限報酬率",
-                "真實淨資產年化(%)": "BBD真實帳戶：扣生活費/利息，餘額買股、不足借款的淨身價成長率",
-                "單純價差年化(%)": "基準線：假設股數永遠不變(配息剛好抵銷提領)，單純由股價上漲的報酬",
-                "理論夏普值": "不考慮提領與借款利息，純粹資產本身的夏普值 (代表原始體質)",
-                "真實夏普值": "扣除生活費與利息後，真實 BBD 帳戶的夏普值",
-                "配息 CV": "變異係數 (標準差÷平均值)。越接近0代表歷年配息金額越平穩"
-            }
-            
             def render_html_table(df):
                 html = "<table style='width:100%; text-align:center; border-collapse: collapse; font-family: sans-serif; font-size: 0.85em;'>"
                 html += "<tr style='background-color: #1E1E1E; border-bottom: 2px solid #444;'>"
                 html += f"<th style='padding: 6px; text-align:left;'>標的名稱</th>"
                 for col in df.columns:
-                    tooltip = TOOLTIPS.get(col, "")
-                    html += f"<th style='padding: 6px; text-align:center;' title='{tooltip}'>{col}</th>"
+                    html += f"<th style='padding: 6px; text-align:center;'>{col}</th>"
                 html += "</tr>"
                 for index, row in df.iterrows():
                     bg_color, font_weight, color = "transparent", "normal", "#E0E0E0"
@@ -636,7 +623,7 @@ if selected_names:
                 st.info("目前清單中沒有包含質押槓桿的策略，無維持率風險。")
 
             # ==========================================
-            # 6. AI 權重與單一押注網格尋優 (導入現金流倒推法)
+            # 6. AI 權重與單一押注網格尋優 (Grid Search)
             # ==========================================
             st.divider()
             st.subheader("🎯 系統判斷與最佳化配比建議 (AI 動態尋優)")
