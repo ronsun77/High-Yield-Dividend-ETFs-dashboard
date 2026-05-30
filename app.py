@@ -82,12 +82,15 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
     total_initial_assets = initial_capital + initial_debt
     target_margin_ratio = (total_initial_assets / initial_debt) if initial_debt > 0 else float('inf')
     
+    # 軌跡 1: 理論含息 (加入槓桿資金，無視提領，配息無限DRIP，利息滾入負債)
     shares_theory = {t: (total_initial_assets * weights[i]) / df_price[t].iloc[0] for i, t in enumerate(df_price.columns)}
     debt_theory = initial_debt
     
+    # 軌跡 2: 真實淨資產 (真實世界的 BBD 帳戶)
     shares_real = {t: (total_initial_assets * weights[i]) / df_price[t].iloc[0] for i, t in enumerate(df_price.columns)}
     debt_real = initial_debt
     
+    # 軌跡 3: 單純價差 (股數永遠不變的基準線)
     shares_static = shares_real.copy()
     
     yearly_expense_accrued = 0
@@ -99,8 +102,11 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
     tickers = df_price.columns
     
     for date, prices in df_price.iterrows():
+        # --- 1. 每日帳務處理 ---
         yearly_expense_accrued += annual_expense / 252
         yearly_interest_accrued += debt_real * daily_borrow_rate
+        
+        # 理論軌跡的利息也每天累積
         debt_theory += debt_theory * daily_borrow_rate
         
         for i, t in enumerate(tickers):
@@ -109,9 +115,13 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
                 div_amount = divs.loc[date]
                 if isinstance(div_amount, pd.Series): div_amount = div_amount.iloc[0]
                 
+                # 理論含息: 立刻全額買回
                 shares_theory[t] += (shares_theory[t] * div_amount) / prices[t]
+                
+                # 真實軌跡: 先存入年度現金池
                 yearly_div_accrued += shares_real[t] * div_amount
 
+        # --- 2. 跨年結算 (BBD 核心邏輯) ---
         year = date.year
         if year != current_year:
             if current_year != -1:
@@ -119,16 +129,20 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
                 net_cash = yearly_div_accrued - total_bill
                 
                 if net_cash > 0:
+                    # 【配息有剩】：全數買入股票，絕不還本金！
                     for i, t in enumerate(tickers):
                         shares_real[t] += (net_cash * weights[i]) / prices[t]
                 else:
                     shortfall = -net_cash
                     if leverage_pct > 0:
+                        # 【配息不夠付】：絕不賣股，直接借錢 (增加負債)
                         debt_real += shortfall
                     else:
+                        # 【無質押】：只能變賣股票求生
                         for i, t in enumerate(tickers):
                             shares_real[t] -= (shortfall * weights[i]) / prices[t]
 
+                # 【恆定維持率策略再平衡】
                 if leverage_pct > 0 and enable_rebalance and target_margin_ratio != float('inf'):
                     val_real = sum([shares_real[t] * prices[t] for t in tickers])
                     if debt_real > 0:
@@ -146,6 +160,7 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
                 
             current_year = year
 
+        # --- 3. 記錄當日資產狀態 ---
         val_theory = sum([shares_theory[t] * prices[t] for t in tickers])
         val_real = sum([shares_real[t] * prices[t] for t in tickers])
         val_static = sum([shares_static[t] * prices[t] for t in tickers])
@@ -167,6 +182,7 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
     traj_df = pd.DataFrame(trajectory).set_index('Date')
     years = len(traj_df) / 252
     
+    # --- 計算指標 ---
     cagr_theory = (traj_df['Net_Theory'].iloc[-1] / initial_capital) ** (1 / years) - 1 if years > 0 and traj_df['Net_Theory'].iloc[-1] > 0 else 0
     cagr_real = (traj_df['Net_Real'].iloc[-1] / initial_capital) ** (1 / years) - 1 if years > 0 and traj_df['Net_Real'].iloc[-1] > 0 else 0
     cagr_static = (traj_df['Net_Static'].iloc[-1] / initial_capital) ** (1 / years) - 1 if years > 0 and traj_df['Net_Static'].iloc[-1] > 0 else 0
@@ -183,7 +199,7 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
     
     rebalance_status = "開啟" if enable_rebalance and leverage_pct > 0 else "關閉"
     
-    # 【Bug修復】總資產公式修正為: 淨資產 + 負債 (確保會計恆等式)
+    # 總資產為最終淨資產 + 最終負債，此數字已涵蓋提領後的結果
     final_net_real = traj_df['Net_Real'].iloc[-1]
     final_total_assets = final_net_real + debt_real
     
@@ -197,7 +213,7 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
         "年化波動率(%)": f"{volatility * 100:.2f}",
         "最大回撤(%)": f"{mdd * 100:.2f}",
         "夏普值": f"{sharpe_ratio:.2f}",
-        "動態擴張": rebalance_status,
+        "恆定維持率": rebalance_status,
         "質押標籤": "質押" if leverage_pct > 0 else "原型" 
     }, traj_df
 
@@ -237,7 +253,7 @@ with st.sidebar:
             weights.append(w / 100)
             
     st.divider()
-    st.header("🔥 4. 質押槓桿與再平衡")
+    st.header("🔥 4. 質押槓桿與策略")
     leverage_mode = st.radio("設定方式", ["依借款比例", "依目標維持率"])
     if leverage_mode == "依借款比例":
         leverage_pct = st.slider("質押借款比例 (%)", 0, 100, 20)
@@ -249,7 +265,7 @@ with st.sidebar:
     
     enable_rebalance = False
     if leverage_pct > 0:
-        enable_rebalance = st.checkbox("⚙️ CLEC 動態恆定維持率 (BBD)", value=False, help="每年底檢視：維持率超過設定值時，增加質押借款買入資產；低於設定值時，不做任何動作(絕不賣股)。")
+        enable_rebalance = st.checkbox("⚙️ 恆定維持率策略", value=False, help="每年底檢視：維持率超過設定值時，增加質押借款買入資產；低於設定值時，不做任何動作(絕不賣股)。")
 
 # ==========================================
 # 5. 主畫面運算與渲染
@@ -289,7 +305,7 @@ if selected_names:
             for col in df_price.columns:
                 etf_name = [k for k, v in current_etf_dict.items() if v == col][0]
                 m, _ = run_simulation(df_price[[col]], div_raw_dict, [1.0], initial_capital, 0, borrow_rate, annual_expense, False)
-                m.update({"標的名稱": etf_name, "質押": "0%", "動態擴張": "-"})
+                m.update({"標的名稱": etf_name, "質押": "0%", "恆定維持率": "-"})
                 
                 fill_rate, fill_days, cv_str, yield_str = "N/A", "N/A", "N/A", "N/A"
                 if col in div_raw_dict and not div_raw_dict[col].empty:
@@ -318,16 +334,16 @@ if selected_names:
                 curr_l_m.update({"標的名稱": f"👁️ 預覽: {custom_name} (質押)", "質押": f"{leverage_pct}%", "年化配息率(%)": "見單檔", "填息成功率": "-", "平均填息天數": "-", "配息 CV": "-"})
                 display_data.append(curr_l_m)
                 
-            ordered_cols = ["標的名稱", "質押", "動態擴張", "最低維持率", "期末淨資產(萬)", "期末總資產(萬)", "理論含息年化(%)", "真實淨資產年化(%)", "單純價差年化(%)", "年化配息率(%)", "填息成功率", "平均填息天數", "年化波動率(%)", "最大回撤(%)", "夏普值", "配息 CV"]
+            ordered_cols = ["標的名稱", "質押", "恆定維持率", "最低維持率", "期末淨資產(萬)", "期末總資產(萬)", "理論含息年化(%)", "真實淨資產年化(%)", "單純價差年化(%)", "年化配息率(%)", "填息成功率", "平均填息天數", "年化波動率(%)", "最大回撤(%)", "夏普值", "配息 CV"]
             comparison_df = pd.DataFrame(display_data).set_index("標的名稱")
             comparison_df = comparison_df[[c for c in ordered_cols if c in comparison_df.columns]]
             
             # 【提示字典】加入表頭 Hover Tooltip
             TOOLTIPS = {
-                "動態擴張": "是否開啟CLEC策略：維持率超標時自動借款買入資產",
+                "恆定維持率": "是否開啟恆定維持率策略：維持率超標時自動借款買入資產",
                 "最低維持率": "評估抗斷頭能力。歷史回測中遭遇最差狀況時的維持率 (低於130%將斷頭)",
-                "期末淨資產(萬)": "扣除質押負債後的真實身價",
-                "期末總資產(萬)": "期末淨資產 + 期末質押負債餘額",
+                "期末淨資產(萬)": "已扣除此期間全部生活費、質押利息與剩餘負債後的真實身價",
+                "期末總資產(萬)": "期末淨資產 + 期末質押負債餘額 (亦已反映提領扣除)",
                 "理論含息年化(%)": "假設不提領生活費，配息100%全額再投入的烏托邦極限報酬率",
                 "真實淨資產年化(%)": "BBD策略真實帳戶：扣除生活費與利息，餘額買股、不足借款的淨身價成長率",
                 "單純價差年化(%)": "對照基準：假設股數永遠不變(配息剛好抵銷提領)，單純由股價上漲帶來的報酬率",
@@ -362,12 +378,14 @@ if selected_names:
             # 績效指標說明面板
             with st.expander("📊 績效指標說明辭典 (點擊展開)", expanded=False):
                 st.markdown("""
+                * **期末淨資產 (萬)**：這段期間內付清所有生活費、繳完所有質押利息、並結清剩餘負債後，你口袋裡真正剩下的錢。
+                * **期末總資產 (萬)**：期末淨資產 + 尚未還清的質押負債餘額（等同於你帳戶裡的股票總市值）。
                 * **最低維持率**：遭遇歷史股災最差狀況時的維持率。小於 130% 代表策略失敗已遭券商斷頭。
                 * **理論含息年化 (%)**：假設完全不需要提領生活費，配息 100% 瘋狂再投入的「烏托邦極限報酬率」。
                 * **真實淨資產年化 (%)**：**核心指標！** BBD 帳戶真實運作：自動扣除生活費/利息，餘額買股、不足借款的真實身價成長率。
                 * **單純價差年化 (%)**：對照組：假設股數永遠凍結不變，純粹靠底層資產漲跌的報酬率。若真實淨資產 > 單純價差，代表你的現金流為正向循環。
                 * **夏普值**：衡量每單位風險的超額報酬 (CP值)，數值越高代表承擔相同波動能換取更多報酬。
-                * **配息 CV**：配息變異係數 (標準差÷平均值)，越接近 0 代表配息金額越平穩，越適合做為 Beta 帳戶核心。
+                * **配息 CV**：配息變異係數 (標準差÷平均值)，越接近 0 代表配息金額越平穩，越適合做為現金流核心。
                 """)
 
             # --- 批次刪除面板 ---
@@ -389,6 +407,7 @@ if selected_names:
                                 st.session_state.saved_portfolios.pop(idx)
                             st.rerun()
 
+            st.caption("💡 **真實淨資產**為BBD運作結果：配息支付生活費與利息，餘額自動買入配息資產，不足額直接轉化為負債，絕不賣股。")
             st.divider()
 
             st.subheader("📈 競技場：所有儲存組合的真實淨資產比較")
@@ -404,7 +423,7 @@ if selected_names:
 
             fig_traj.add_trace(go.Scatter(x=curr_p_t.index, y=curr_p_t['Net_Real'], mode='lines', name=f'👁️預覽: {custom_name} (無質押)', line=dict(width=3, color='#2ECC71')))
             if leverage_pct > 0:
-                rebalance_tag = " [動態擴張]" if enable_rebalance else " [不還本]"
+                rebalance_tag = " [恆定維持率]" if enable_rebalance else " [不還本]"
                 fig_traj.add_trace(go.Scatter(x=curr_l_t.index, y=curr_l_t['Net_Real'], mode='lines', name=f'👁️預覽: {custom_name} (質押 {leverage_pct}%){rebalance_tag}', line=dict(width=3, color='#E74C3C')))
             
             fig_traj.update_layout(hovermode="x unified", yaxis_title="淨資產金額 (元)", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
@@ -429,7 +448,7 @@ if selected_names:
                 
                 target_margin_show = ((1 + leverage_pct/100) / (leverage_pct/100) * 100)
                 if enable_rebalance:
-                    fig_margin.add_hline(y=target_margin_show, line_dash="dash", line_color="green", annotation_text=f"預覽擴張目標線 ({target_margin_show:.0f}%)", annotation_position="top left")
+                    fig_margin.add_hline(y=target_margin_show, line_dash="dash", line_color="green", annotation_text=f"預覽恆定目標線 ({target_margin_show:.0f}%)", annotation_position="top left")
 
             if has_margin_data:
                 fig_margin.add_hline(y=166, line_dash="dash", line_color="orange", annotation_text="166% (追繳線)", annotation_position="bottom right")
