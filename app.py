@@ -101,7 +101,6 @@ def get_portfolio_yield_cv(tickers, df_price, div_raw_dict, weights, leverage_pc
     lev_str = f"{lev_yield * 100:.2f}"
     
     cv_str = "-"
-    # Bug fixed: removed the random typo "Glen"
     if not port_annual_divs.empty and len(port_annual_divs[port_annual_divs > 0]) >= 2:
         valid = port_annual_divs[port_annual_divs > 0]
         cv_str = f"{valid.std() / valid.mean():.2f}"
@@ -321,6 +320,11 @@ with st.sidebar:
     enable_rebalance = False
     if leverage_pct > 0:
         enable_rebalance = st.checkbox("⚙️ 恆定維持率策略", value=False, help="每年底檢視：維持率超過設定值時，增加質押借款買入資產；低於設定值時，不做任何動作(絕不賣股)。")
+
+    # --- 新增：AI 尋優防禦底線設定 ---
+    st.divider()
+    st.header("🎯 5. AI 尋優防禦底線設定")
+    ai_min_margin = st.number_input("股災最低容許維持率 (%)", min_value=140, max_value=500, value=250, step=10, help="設定 AI 尋優的嚴格底線。歷史回測中若維持率跌破此數值，AI 將直接淘汰該策略。建議設定 >200% 以保留安全距離，避免「走鋼索」。")
 
     st.divider()
     st.header("🛡️ 戰略評估與大盤容許跌幅試算")
@@ -609,7 +613,7 @@ if selected_names:
             st.subheader("🎯 系統判斷與最佳化配比建議 (AI 動態尋優)")
             
             if st.button("🚀 啟動 AI 智慧尋優矩陣運算", type="primary", use_container_width=True):
-                with st.spinner("AI 正在背景進行數百次全配置交叉比對（包含單一押注與複合配置）..."):
+                with st.spinner(f"AI 正在背景進行數百次全配置交叉比對 (防禦底線設定：{ai_min_margin}%)..."):
                     num_assets = len(selected_tickers)
                     step_pct = 10 if num_assets <= 3 else (20 if num_assets == 4 else 25)
                     weight_grids = generate_weight_combinations(num_assets, step_pct)
@@ -618,7 +622,12 @@ if selected_names:
                     best_mdd_list = []
                     best_net_list = []
                     
-                    margin_targets = [200, 250, 300, 350, 400, 450, 500]
+                    # 依據防禦底線動態調整測試網格，避免測試注定失敗的低維持率
+                    margin_targets = [250, 300, 350, 400, 450, 500, 600, 800]
+                    margin_targets = [m for m in margin_targets if m > ai_min_margin]
+                    if not margin_targets: 
+                        margin_targets = [ai_min_margin + 50, ai_min_margin + 100]
+                        
                     leverage_targets = [round(100 / (m/100 - 1)) for m in margin_targets]
                     
                     for w in weight_grids:
@@ -626,7 +635,8 @@ if selected_names:
                             margin_target = margin_targets[idx]
                             _, _, raw = run_simulation(df_price[selected_tickers], div_raw_dict, w, initial_capital, lev, borrow_rate, annual_expense, True, margin_target)
                             
-                            if raw['min_maintenance'] > 140 and raw['final_net_real'] > initial_capital:
+                            # 核心防禦約束：利用使用者自訂的 ai_min_margin 篩選
+                            if raw['min_maintenance'] >= ai_min_margin and raw['final_net_real'] > initial_capital:
                                 w_str = " + ".join([f"{name[:5]} {w[i]*100:.0f}%" for i, name in enumerate(selected_names) if w[i] > 0])
                                 result = {
                                     "w_str": w_str,
@@ -635,7 +645,8 @@ if selected_names:
                                     "sharpe": raw['sharpe_real'],
                                     "mdd": raw['mdd'],
                                     "net": raw['final_net_real'],
-                                    "cagr": raw['cagr_real']
+                                    "cagr": raw['cagr_real'],
+                                    "min_margin": raw['min_maintenance']
                                 }
                                 best_sharpe_list.append(result)
                                 best_mdd_list.append(result)
@@ -655,23 +666,23 @@ if selected_names:
                             st.markdown("針對風控與獲利取得最佳平衡點的組合：")
                             for i, res in enumerate(best_sharpe_list[:3]):
                                 rank = ["❶ 冠軍", "❷ 亞軍", "❸ 季軍"][i]
-                                st.info(f"**{rank}：{res['w_str']}**\n* 策略：恆定維持率 **{res['margin']}%**\n* 成效：真實夏普 **{res['sharpe']:.2f}** / 回撤 **{res['mdd']*100:.2f}%**")
+                                st.info(f"**{rank}：{res['w_str']}**\n* 策略：恆定維持率 **{res['margin']}%**\n* 成效：真實夏普 **{res['sharpe']:.2f}** / 回撤 **{res['mdd']*100:.2f}%**\n* 🛡️ 最低維持率：**{res['min_margin']:.0f}%** (距離斷頭線仍有充裕緩衝)")
                         
                         with col_opt2:
                             st.subheader("🛡️ 絕對防禦 (最大回撤極小化)")
-                            st.markdown("不盲目追求高報酬，以極致抗震、安全存活為首要目標：")
+                            st.markdown("不盲目追求高報酬，以極致抗震、安全存活為首要目標 (常為單一防禦資產)：")
                             for i, res in enumerate(best_mdd_list[:3]):
                                 rank = ["❶ 冠軍", "❷ 亞軍", "❸ 季軍"][i]
-                                st.warning(f"**{rank}：{res['w_str']}**\n* 策略：恆定維持率 **{res['margin']}%**\n* 成效：極限回撤 **{res['mdd']*100:.2f}%** / 真實夏普 **{res['sharpe']:.2f}**")
+                                st.warning(f"**{rank}：{res['w_str']}**\n* 策略：恆定維持率 **{res['margin']}%**\n* 成效：極限回撤 **{res['mdd']*100:.2f}%** / 真實夏普 **{res['sharpe']:.2f}**\n* 🛡️ 最低維持率：**{res['min_margin']:.0f}%** (睡得最安穩)")
                         
                         with col_opt3:
                             st.subheader("🚀 暴力擴張 (期末資產最大化)")
-                            st.markdown("在保證絕對不賣股、不斷頭的前提下，榨出最高絕對財富：")
+                            st.markdown("在保證絕對不跌破防禦底線的前提下，榨出最高絕對財富：")
                             for i, res in enumerate(best_net_list[:3]):
                                 rank = ["❶ 冠軍", "❷ 亞軍", "❸ 季軍"][i]
-                                st.error(f"**{rank}：{res['w_str']}**\n* 策略：恆定維持率 **{res['margin']}%**\n* 成效：期末淨資產 **{res['net']/10000:.0f} 萬** / 年化 **{res['cagr']*100:.2f}%**")
+                                st.error(f"**{rank}：{res['w_str']}**\n* 策略：恆定維持率 **{res['margin']}%**\n* 成效：期末淨資產 **{res['net']/10000:.0f} 萬** / 年化 **{res['cagr']*100:.2f}%**\n* 🛡️ 最低維持率：**{res['min_margin']:.0f}%** (極限操作)")
                     else:
-                        st.info("在目前的提領壓力與時間軸下，系統無法找到能保證 100% 存活且不傷本的槓桿組合。建議調整提領金額。")
+                        st.info(f"在目前的提領壓力與防禦底線 ({ai_min_margin}%) 下，系統無法找到保證存活且不傷本的組合。建議降低提領金額或調降防禦底線標準。")
             else:
                 st.info("💡 調整完左側參數或 ETF 權重後，點擊上方按鈕即可啟動多目標 AI 尋優計算。")
 
