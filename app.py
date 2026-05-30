@@ -307,7 +307,8 @@ with st.sidebar:
     st.divider()
     
     st.header("🕒 2. 回測時間區間")
-    default_start = datetime.today() - timedelta(days=5*365)
+    # 將預設起始時間修改為 2011-01-01
+    default_start = datetime(2011, 1, 1)
     start_date = st.date_input("開始日期", value=default_start)
     end_date = st.date_input("結束日期", value=datetime.today())
     st.divider()
