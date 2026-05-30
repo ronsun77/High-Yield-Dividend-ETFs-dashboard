@@ -158,7 +158,6 @@ if selected_names:
                 metrics_list.append(calculate_metrics(daily_returns[col].dropna(), etf_name, etf_div_series))
             
             # 自訂組合績效與合成 CV
-            # 假設投資組合的配息也是按權重分配 (簡化模型)
             port_div_series = None
             if not df_div.empty:
                 valid_div_cols = [c for c in df_div.columns if c in selected_tickers]
@@ -182,22 +181,26 @@ if selected_names:
             # --- 繪製歷年配息柱狀圖 ---
             st.subheader("💰 歷年配息金額動態比較")
             if not df_div.empty:
-                # 篩選出近 10 年的資料讓圖表更乾淨
-                recent_years = df_div[df_div.index >= (datetime.today().year - 10)]
-                # 將 index 轉換為文字，避免 Plotly 將年份視為連續數值
+                # 篩選出近 10 年的資料讓圖表更乾淨，並強制複製一份避免警告
+                recent_years = df_div[df_div.index >= (datetime.today().year - 10)].copy()
                 recent_years.index = recent_years.index.astype(str)
+                
+                # 強制命名 index，避免 reset_index 後發生 KeyError
+                recent_years.index.name = '年份'
                 
                 # 將列名從代碼轉換為中文名稱
                 rename_dict = {v: k for k, v in ETF_DICT.items()}
                 recent_years = recent_years.rename(columns=rename_dict)
                 
+                # 繪圖資料轉換
+                melted_df = recent_years.reset_index().melt(id_vars='年份', var_name='ETF', value_name='年度配息總額 (元)')
+                
                 fig_div = px.bar(
-                    recent_years.reset_index().melt(id_vars='index', var_name='ETF', value_name='年度配息總額 (元)'),
-                    x='index', 
+                    melted_df,
+                    x='年份', 
                     y='年度配息總額 (元)', 
                     color='ETF',
-                    barmode='group',
-                    labels={'index': '年份'}
+                    barmode='group'
                 )
                 fig_div.update_layout(
                     hovermode="x unified",
