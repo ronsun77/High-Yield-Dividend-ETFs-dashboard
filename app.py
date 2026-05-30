@@ -7,17 +7,15 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
 # ==========================================
-# 1. 網頁設定 & 暫存初始化 (含舊資料清洗機制)
+# 1. 網頁設定 & 暫存初始化
 # ==========================================
 st.set_page_config(page_title="高股息策略與質押模擬器", layout="wide")
 st.title("🛡️ 台灣高股息 ETF 買借死 (BBD) 質押模擬器")
 
-# 防呆機制：如果偵測到舊版的靜態資料格式，自動清空以套用新的動態基因架構
 if 'saved_portfolios' not in st.session_state:
     st.session_state.saved_portfolios = []
 elif len(st.session_state.saved_portfolios) > 0 and 'tickers' not in st.session_state.saved_portfolios[0]:
     st.session_state.saved_portfolios = []
-
 if 'custom_etfs' not in st.session_state:
     st.session_state.custom_etfs = {}
 
@@ -30,7 +28,7 @@ DEFAULT_ETF_DICT = {
 }
 
 # ==========================================
-# 2. 資料抓取引擎 (強制對齊時間軸)
+# 2. 資料抓取與輔助運算引擎
 # ==========================================
 @st.cache_data(ttl=3600)
 def load_raw_data(tickers, start_date, end_date):
@@ -107,7 +105,7 @@ def get_portfolio_yield_cv(tickers, df_price, div_raw_dict, weights, leverage_pc
         valid = port_annual_divs[port_annual_divs > 0]
         cv_str = f"{valid.std() / valid.mean():.2f}"
         
-    return no_lev_str, lev_str, cv_str
+    return no_lev_str, lev_str, cv_str, port_base_yield
 
 # ==========================================
 # 3. 真實 BBD 提領模擬器
@@ -122,10 +120,8 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
     
     shares_theory = {t: (total_initial_assets * weights[i]) / df_price[t].iloc[0] for i, t in enumerate(df_price.columns)}
     debt_theory = initial_debt
-    
     shares_real = {t: (total_initial_assets * weights[i]) / df_price[t].iloc[0] for i, t in enumerate(df_price.columns)}
     debt_real = initial_debt
-    
     shares_static = shares_real.copy()
     
     yearly_expense_accrued = 0
@@ -281,6 +277,7 @@ with st.sidebar:
     leverage_mode = st.radio("設定方式", ["依借款比例", "依目標維持率"])
     if leverage_mode == "依借款比例":
         leverage_pct = st.slider("質押借款比例 (%)", 0, 100, 20)
+        target_margin = ((1 + leverage_pct/100) / (leverage_pct/100) * 100) if leverage_pct > 0 else float('inf')
     else:
         target_margin = st.number_input("目標初始維持率 (%)", min_value=130, max_value=1000, value=166, step=10)
         leverage_pct = round(100 / (target_margin/100 - 1)) if target_margin > 100 else 0
@@ -291,6 +288,36 @@ with st.sidebar:
     if leverage_pct > 0:
         enable_rebalance = st.checkbox("⚙️ 恆定維持率策略", value=False, help="每年底檢視：維持率超過設定值時，增加質押借款買入資產；低於設定值時，不做任何動作(絕不賣股)。")
 
+    # --- 新增：即時戰略評估區塊 ---
+    st.divider()
+    st.header("🛡️ 戰略評估與斷頭風險試算")
+    if leverage_pct > 0:
+        debt_amt = initial_capital * (leverage_pct / 100)
+        total_amt = initial_capital + debt_amt
+        
+        # 斷頭安全邊際公式：1 - (追繳/斷頭成數 * 借款金額) / 總資產
+        drop_to_166 = (1 - (1.66 * debt_amt) / total_amt) * 100
+        drop_to_130 = (1 - (1.30 * debt_amt) / total_amt) * 100
+        
+        # 損平殖利率公式：(生活費 + 質押利息) / 總資產
+        annual_interest = debt_amt * (borrow_rate / 100)
+        total_liability = annual_expense + annual_interest
+        breakeven_yield = (total_liability / total_amt) * 100
+        
+        st.info(f"""
+        **🚨 容許大盤最大跌幅 (安全邊際)**
+        * 跌至 166% (追繳)：跌幅約 **-{drop_to_166:.1f}%**
+        * 跌至 130% (斷頭)：跌幅約 **-{drop_to_130:.1f}%**
+        
+        **⚖️ 現金流損平分析**
+        * 每年生活費：{annual_expense/10000:.1f} 萬
+        * 每年預估利息：{annual_interest/10000:.1f} 萬
+        * 總資產損平殖利率需達：**{breakeven_yield:.2f}%**
+        *(若 ETF 殖利率低於此數字，每年將面臨失血)*
+        """)
+    else:
+        st.info("無質押，資產絕對安全 (無斷頭風險)。\n* 但需承擔股息不足時變賣本金的風險。")
+
 # ==========================================
 # 5. 主畫面運算與渲染
 # ==========================================
@@ -298,12 +325,11 @@ if selected_names:
     if sum(weights) != 1.0:
         st.error(f"⚠️ 權重總和需為 100%，目前為 {sum(weights)*100:.0f}%")
     else:
-        # 收集「當前選擇」與「已儲存策略」中的所有不重複 ETF，一次性抓取資料
         all_required_tickers = set(current_etf_dict[name] for name in selected_names)
         for strat in st.session_state.saved_portfolios:
             all_required_tickers.update(strat['tickers'])
             
-        with st.spinner("啟動 Buy Borrow Die 提領與擴張模擬引擎 (多策略動態重算中)..."):
+        with st.spinner("啟動 Buy Borrow Die 提領與擴張模擬引擎..."):
             df_price, div_raw_dict = load_raw_data(list(all_required_tickers), start_date, end_date)
             
         if not df_price.empty:
@@ -311,15 +337,43 @@ if selected_names:
             actual_end = df_price.index[-1].strftime('%Y-%m-%d')
             
             selected_tickers = [current_etf_dict[name] for name in selected_names]
-            port_yield_no_lev, port_yield_lev, port_cv = get_portfolio_yield_cv(selected_tickers, df_price, div_raw_dict, weights, leverage_pct, borrow_rate)
+            port_yield_no_lev, port_yield_lev, port_cv, raw_port_yield = get_portfolio_yield_cv(selected_tickers, df_price, div_raw_dict, weights, leverage_pct, borrow_rate)
             
+            # --- 儀表板：即時現金流健康度 ---
+            st.subheader("📊 預估首年現金流健康度 (以歷史平均殖利率估算)")
+            if leverage_pct > 0:
+                est_div = (initial_capital * (1 + leverage_pct/100)) * raw_port_yield
+                est_interest = (initial_capital * (leverage_pct/100)) * (borrow_rate / 100)
+                net_cash = est_div - est_interest - annual_expense
+                
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("預估總股息收入", f"{est_div/10000:.1f} 萬")
+                col2.metric("生活費提領", f"-{annual_expense/10000:.1f} 萬")
+                col3.metric("預估利息支出", f"-{est_interest/10000:.1f} 萬")
+                
+                if net_cash >= 0:
+                    col4.metric("💰 預估年底可買股餘額", f"+{net_cash/10000:.1f} 萬", "正向循環")
+                else:
+                    col4.metric("🩸 預估年底需借款缺口", f"{net_cash/10000:.1f} 萬", "失血負債", delta_color="inverse")
+            else:
+                est_div = initial_capital * raw_port_yield
+                net_cash = est_div - annual_expense
+                
+                col1, col2, col3 = st.columns(3)
+                col1.metric("預估總股息收入", f"{est_div/10000:.1f} 萬")
+                col2.metric("生活費提領", f"-{annual_expense/10000:.1f} 萬")
+                if net_cash >= 0:
+                    col3.metric("💰 預估年底可買股餘額", f"+{net_cash/10000:.1f} 萬", "正向循環")
+                else:
+                    col3.metric("🩸 預估年底被迫變賣本金", f"{net_cash/10000:.1f} 萬", "萎縮風險", delta_color="inverse")
+            st.divider()
+
             st.subheader("💾 命名與保存當前策略")
             col_name, col_btn = st.columns([3, 1])
             with col_name:
                 custom_name = st.text_input("✏️ 為此投資組合命名", value="我的現金流組合", label_visibility="collapsed")
             with col_btn:
                 if st.button("➕ 記錄至績效比較表", type="primary", use_container_width=True):
-                    # 儲存策略「基因」，不存死數字
                     st.session_state.saved_portfolios.append({
                         "name": f"🎯 {custom_name} (無質押)",
                         "tickers": selected_tickers,
@@ -336,13 +390,12 @@ if selected_names:
                             "leverage_pct": leverage_pct,
                             "enable_rebalance": enable_rebalance
                         })
-                    st.rerun() # 重新刷新畫面觸發重算
+                    st.rerun() 
             st.divider()
 
             st.subheader(f"📋 全境動態績效比較表 (同期基準: {actual_start} 至 {actual_end})")
             display_data = []
             
-            # --- 1. 計算當前選擇的單一 ETF 基準線 ---
             for col in selected_tickers:
                 if col in df_price.columns:
                     etf_name = [k for k, v in current_etf_dict.items() if v == col][0]
@@ -362,7 +415,6 @@ if selected_names:
                     m.update({"年化配息率(%)": yield_str, "填息成功率": fill_rate, "平均填息天數": fill_days, "配息 CV": cv_str})
                     display_data.append(m)
                 
-            # --- 2. 動態重新運算所有儲存的歷史策略 ---
             for strat in st.session_state.saved_portfolios:
                 s_tickers = strat['tickers']
                 s_weights = strat['weights']
@@ -373,7 +425,7 @@ if selected_names:
                         initial_capital, strat['leverage_pct'], borrow_rate, annual_expense, strat['enable_rebalance']
                     )
                     
-                    y_no_lev, y_lev, cv = get_portfolio_yield_cv(s_tickers, df_price, div_raw_dict, s_weights, strat['leverage_pct'], borrow_rate)
+                    y_no_lev, y_lev, cv, _ = get_portfolio_yield_cv(s_tickers, df_price, div_raw_dict, s_weights, strat['leverage_pct'], borrow_rate)
                     m.update({
                         "標的名稱": strat['name'],
                         "質押": f"{strat['leverage_pct']}%" if strat['leverage_pct'] > 0 else "0%",
@@ -383,9 +435,8 @@ if selected_names:
                         "配息 CV": cv
                     })
                     display_data.append(m)
-                    strat['computed_traj'] = t_df # 暫存重算後的曲線供繪圖使用
+                    strat['computed_traj'] = t_df 
                 
-            # --- 3. 當前預覽組合 ---
             curr_p_m, curr_p_t = run_simulation(df_price[selected_tickers], div_raw_dict, weights, initial_capital, 0, borrow_rate, annual_expense, False)
             curr_p_m.update({"標的名稱": f"👁️ 預覽: {custom_name} (無質押)", "質押": "0%", "恆定維持率": "-", "年化配息率(%)": port_yield_no_lev, "填息成功率": "-", "平均填息天數": "-", "配息 CV": port_cv})
             display_data.append(curr_p_m)
@@ -395,7 +446,6 @@ if selected_names:
                 curr_l_m.update({"標的名稱": f"👁️ 預覽: {custom_name} (質押)", "質押": f"{leverage_pct}%", "年化配息率(%)": port_yield_lev, "填息成功率": "-", "平均填息天數": "-", "配息 CV": port_cv})
                 display_data.append(curr_l_m)
                 
-            # --- 整理與渲染表格 ---
             ordered_cols = ["標的名稱", "質押", "恆定維持率", "最低維持率", "期末淨資產(萬)", "期末總資產(萬)", "理論含息年化(%)", "真實淨資產年化(%)", "單純價差年化(%)", "年化配息率(%)", "填息成功率", "平均填息天數", "年化波動率(%)", "最大回撤(%)", "理論夏普值", "真實夏普值", "配息 CV"]
             comparison_df = pd.DataFrame(display_data).set_index("標的名稱")
             comparison_df = comparison_df[[c for c in ordered_cols if c in comparison_df.columns]]
@@ -471,14 +521,12 @@ if selected_names:
             st.caption("💡 **注意：** 所有歷史紀錄皆已綁定左側全局參數。修改本金、生活費或時間區間，表格將即時全數重算。")
             st.divider()
 
-            # --- 資金曲線圖 ---
             st.subheader("📈 競技場：所有儲存組合的真實淨資產比較")
             fig_traj = go.Figure()
             
             fig_traj.add_trace(go.Scatter(x=curr_p_t.index, y=curr_p_t['Net_Theory'], mode='lines', name='[參考] 當前組合理論含息 (無視提領/利息)', line=dict(color='#BDC3C7', width=1, dash='dot')))
             fig_traj.add_trace(go.Scatter(x=curr_p_t.index, y=curr_p_t['Net_Static'], mode='lines', name='[參考] 當前組合單純價差 (股數不變)', line=dict(color='#7F8C8D', width=1, dash='dash')))
             
-            # 畫出重算後的歷史紀錄曲線
             for strat in st.session_state.saved_portfolios:
                 if 'computed_traj' in strat:
                     name = strat['name']
@@ -493,7 +541,6 @@ if selected_names:
             fig_traj.update_layout(hovermode="x unified", yaxis_title="淨資產金額 (元)", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
             st.plotly_chart(fig_traj, use_container_width=True, key="traj_chart_main")
             
-            # --- 維持率圖表 ---
             st.subheader("🚨 質押維持率壓力監測競技場")
             fig_margin = go.Figure()
             has_margin_data = False
