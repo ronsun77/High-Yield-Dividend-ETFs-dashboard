@@ -26,7 +26,7 @@ DEFAULT_ETF_DICT = {
 }
 
 # ==========================================
-# 2. 資料抓取引擎 (強制對齊時間軸)
+# 2. 資料抓取引擎
 # ==========================================
 @st.cache_data(ttl=3600)
 def load_raw_data(tickers, start_date, end_date):
@@ -72,7 +72,6 @@ def calculate_fill_rate(div_series_dict, price_series, ticker):
     return f"{(success_count / len(divs)) * 100:.0f}%", f"{total_days / success_count:.0f}"
 
 def get_portfolio_yield_cv(tickers, df_price, div_raw_dict, weights, leverage_pct, borrow_rate):
-    """計算投資組合的綜合年化配息率與配息變異係數 (CV)"""
     base_yields = []
     port_annual_divs = pd.Series(dtype=float)
     
@@ -119,8 +118,10 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
     
     shares_theory = {t: (total_initial_assets * weights[i]) / df_price[t].iloc[0] for i, t in enumerate(df_price.columns)}
     debt_theory = initial_debt
+    
     shares_real = {t: (total_initial_assets * weights[i]) / df_price[t].iloc[0] for i, t in enumerate(df_price.columns)}
     debt_real = initial_debt
+    
     shares_static = shares_real.copy()
     
     yearly_expense_accrued = 0
@@ -199,13 +200,19 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
     traj_df = pd.DataFrame(trajectory).set_index('Date')
     years = len(traj_df) / 252
     
+    # --- 計算指標 ---
     cagr_theory = (traj_df['Net_Theory'].iloc[-1] / initial_capital) ** (1 / years) - 1 if years > 0 and traj_df['Net_Theory'].iloc[-1] > 0 else 0
     cagr_real = (traj_df['Net_Real'].iloc[-1] / initial_capital) ** (1 / years) - 1 if years > 0 and traj_df['Net_Real'].iloc[-1] > 0 else 0
     cagr_static = (traj_df['Net_Static'].iloc[-1] / initial_capital) ** (1 / years) - 1 if years > 0 and traj_df['Net_Static'].iloc[-1] > 0 else 0
     
+    # 兩組波動率與夏普值
+    daily_ret_theory = traj_df['Net_Theory'].pct_change().dropna()
+    vol_theory = daily_ret_theory.std() * np.sqrt(252) if not daily_ret_theory.empty else 0
+    sharpe_theory = (cagr_theory - 0.015) / vol_theory if vol_theory != 0 else 0
+    
     daily_ret_real = traj_df['Net_Real'].pct_change().dropna()
-    volatility = daily_ret_real.std() * np.sqrt(252) if not daily_ret_real.empty else 0
-    sharpe_ratio = (cagr_real - 0.015) / volatility if volatility != 0 else 0
+    vol_real = daily_ret_real.std() * np.sqrt(252) if not daily_ret_real.empty else 0
+    sharpe_real = (cagr_real - 0.015) / vol_real if vol_real != 0 else 0
     
     cum_real = traj_df['Net_Real'] / initial_capital
     running_max = cum_real.cummax()
@@ -224,9 +231,10 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
         "真實淨資產年化(%)": f"{cagr_real * 100:.2f}",
         "單純價差年化(%)": f"{cagr_static * 100:.2f}",
         "最低維持率": f"{min_maintenance:.0f}%" if min_maintenance != float('inf') else "-",
-        "年化波動率(%)": f"{volatility * 100:.2f}",
+        "年化波動率(%)": f"{vol_real * 100:.2f}",
         "最大回撤(%)": f"{mdd * 100:.2f}",
-        "夏普值": f"{sharpe_ratio:.2f}",
+        "理論夏普值": f"{sharpe_theory:.2f}",
+        "真實夏普值": f"{sharpe_real:.2f}",
         "恆定維持率": rebalance_status,
         "質押標籤": "質押" if leverage_pct > 0 else "原型" 
     }, traj_df
@@ -296,7 +304,6 @@ if selected_names:
             actual_start = df_price.index[0].strftime('%Y-%m-%d')
             actual_end = df_price.index[-1].strftime('%Y-%m-%d')
             
-            # 計算投資組合整體的 Yield 與 CV
             port_yield_no_lev, port_yield_lev, port_cv = get_portfolio_yield_cv(selected_tickers, df_price, div_raw_dict, weights, leverage_pct, borrow_rate)
             
             st.subheader("💾 命名與保存當前策略")
@@ -337,12 +344,11 @@ if selected_names:
                 m.update({"年化配息率(%)": yield_str, "填息成功率": fill_rate, "平均填息天數": fill_days, "配息 CV": cv_str})
                 display_data.append(m)
                 
-            # 歷史紀錄 (加入防呆清洗機制，避免舊的 nan 字串影響版面)
+            # 歷史紀錄
             for item in st.session_state.saved_portfolios:
                 metrics_copy = item['metrics'].copy()
                 for k, v in metrics_copy.items():
-                    if str(v).lower() == 'nan':
-                        metrics_copy[k] = "-"
+                    if str(v).lower() == 'nan': metrics_copy[k] = "-"
                 display_data.append(metrics_copy)
                 
             # 當前預覽
@@ -355,7 +361,7 @@ if selected_names:
                 curr_l_m.update({"標的名稱": f"👁️ 預覽: {custom_name} (質押)", "質押": f"{leverage_pct}%", "年化配息率(%)": port_yield_lev, "填息成功率": "-", "平均填息天數": "-", "配息 CV": port_cv})
                 display_data.append(curr_l_m)
                 
-            ordered_cols = ["標的名稱", "質押", "恆定維持率", "最低維持率", "期末淨資產(萬)", "期末總資產(萬)", "理論含息年化(%)", "真實淨資產年化(%)", "單純價差年化(%)", "年化配息率(%)", "填息成功率", "平均填息天數", "年化波動率(%)", "最大回撤(%)", "夏普值", "配息 CV"]
+            ordered_cols = ["標的名稱", "質押", "恆定維持率", "最低維持率", "期末淨資產(萬)", "期末總資產(萬)", "理論含息年化(%)", "真實淨資產年化(%)", "單純價差年化(%)", "年化配息率(%)", "填息成功率", "平均填息天數", "年化波動率(%)", "最大回撤(%)", "理論夏普值", "真實夏普值", "配息 CV"]
             comparison_df = pd.DataFrame(display_data).set_index("標的名稱")
             comparison_df = comparison_df[[c for c in ordered_cols if c in comparison_df.columns]]
             
@@ -367,7 +373,8 @@ if selected_names:
                 "理論含息年化(%)": "假設不提領生活費，配息100%全額再投入的極限報酬率",
                 "真實淨資產年化(%)": "BBD真實帳戶：扣生活費/利息，餘額買股、不足借款的淨身價成長率",
                 "單純價差年化(%)": "基準線：假設股數永遠不變(配息剛好抵銷提領)，單純由股價上漲的報酬",
-                "夏普值": "衡量承受每單位風險所獲得的超額報酬 (以真實軌跡計算)，越高越好",
+                "理論夏普值": "不考慮提領與借款利息，純粹資產本身的夏普值 (通常網站公布的數字)",
+                "真實夏普值": "扣除生活費與利息後，真實 BBD 帳戶的夏普值",
                 "配息 CV": "變異係數 (標準差÷平均值)。越接近0代表歷年配息金額越平穩"
             }
             
@@ -403,7 +410,8 @@ if selected_names:
                 * **理論含息年化 (%)**：假設完全不需要提領生活費，配息 100% 瘋狂再投入的「烏托邦極限報酬率」。
                 * **真實淨資產年化 (%)**：**核心指標！** BBD 帳戶真實運作：自動扣除生活費/利息，餘額買股、不足借款的真實身價成長率。
                 * **單純價差年化 (%)**：對照組：假設股數永遠凍結不變，純粹靠底層資產漲跌的報酬率。若真實淨資產 > 單純價差，代表你的現金流為正向循環。
-                * **夏普值**：衡量每單位風險的超額報酬 (CP值)，數值越高代表承擔相同波動能換取更多報酬。
+                * **理論夏普值**：不考慮提領與借款利息，純粹資產本身的夏普值 (通常網站公布的數字，代表原始體質)。
+                * **真實夏普值**：扣除生活費與利息後，承擔提領壓力下的真實 BBD 帳戶夏普值 (通常較低)。
                 * **配息 CV**：配息變異係數 (標準差÷平均值)，越接近 0 代表配息金額越平穩，越適合做為現金流核心。
                 """)
 
