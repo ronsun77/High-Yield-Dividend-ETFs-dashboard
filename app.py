@@ -82,15 +82,12 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
     total_initial_assets = initial_capital + initial_debt
     target_margin_ratio = (total_initial_assets / initial_debt) if initial_debt > 0 else float('inf')
     
-    # 軌跡 1: 理論含息 (加入槓桿資金，無視提領，配息無限DRIP，利息滾入負債)
     shares_theory = {t: (total_initial_assets * weights[i]) / df_price[t].iloc[0] for i, t in enumerate(df_price.columns)}
     debt_theory = initial_debt
     
-    # 軌跡 2: 真實淨資產 (真實世界的 BBD 帳戶)
     shares_real = {t: (total_initial_assets * weights[i]) / df_price[t].iloc[0] for i, t in enumerate(df_price.columns)}
     debt_real = initial_debt
     
-    # 軌跡 3: 單純價差 (股數永遠不變的基準線)
     shares_static = shares_real.copy()
     
     yearly_expense_accrued = 0
@@ -102,11 +99,8 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
     tickers = df_price.columns
     
     for date, prices in df_price.iterrows():
-        # --- 1. 每日帳務處理 ---
         yearly_expense_accrued += annual_expense / 252
         yearly_interest_accrued += debt_real * daily_borrow_rate
-        
-        # 理論軌跡的利息也每天累積
         debt_theory += debt_theory * daily_borrow_rate
         
         for i, t in enumerate(tickers):
@@ -115,13 +109,9 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
                 div_amount = divs.loc[date]
                 if isinstance(div_amount, pd.Series): div_amount = div_amount.iloc[0]
                 
-                # 理論含息: 立刻全額買回
                 shares_theory[t] += (shares_theory[t] * div_amount) / prices[t]
-                
-                # 真實軌跡: 先存入年度現金池
                 yearly_div_accrued += shares_real[t] * div_amount
 
-        # --- 2. 跨年結算 (BBD 核心邏輯) ---
         year = date.year
         if year != current_year:
             if current_year != -1:
@@ -129,20 +119,16 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
                 net_cash = yearly_div_accrued - total_bill
                 
                 if net_cash > 0:
-                    # 【配息有剩】：全數買入股票，絕不還本金！
                     for i, t in enumerate(tickers):
                         shares_real[t] += (net_cash * weights[i]) / prices[t]
                 else:
                     shortfall = -net_cash
                     if leverage_pct > 0:
-                        # 【配息不夠付】：絕不賣股，直接借錢 (增加負債)
                         debt_real += shortfall
                     else:
-                        # 【無質押】：只能變賣股票求生
                         for i, t in enumerate(tickers):
                             shares_real[t] -= (shortfall * weights[i]) / prices[t]
 
-                # 【CLEC 動態擴張再平衡】
                 if leverage_pct > 0 and enable_rebalance and target_margin_ratio != float('inf'):
                     val_real = sum([shares_real[t] * prices[t] for t in tickers])
                     if debt_real > 0:
@@ -160,7 +146,6 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
                 
             current_year = year
 
-        # --- 3. 記錄當日資產狀態 ---
         val_theory = sum([shares_theory[t] * prices[t] for t in tickers])
         val_real = sum([shares_real[t] * prices[t] for t in tickers])
         val_static = sum([shares_static[t] * prices[t] for t in tickers])
@@ -182,7 +167,6 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
     traj_df = pd.DataFrame(trajectory).set_index('Date')
     years = len(traj_df) / 252
     
-    # --- 計算指標 ---
     cagr_theory = (traj_df['Net_Theory'].iloc[-1] / initial_capital) ** (1 / years) - 1 if years > 0 and traj_df['Net_Theory'].iloc[-1] > 0 else 0
     cagr_real = (traj_df['Net_Real'].iloc[-1] / initial_capital) ** (1 / years) - 1 if years > 0 and traj_df['Net_Real'].iloc[-1] > 0 else 0
     cagr_static = (traj_df['Net_Static'].iloc[-1] / initial_capital) ** (1 / years) - 1 if years > 0 and traj_df['Net_Static'].iloc[-1] > 0 else 0
@@ -332,7 +316,6 @@ if selected_names:
                 
             ordered_cols = ["標的名稱", "質押", "動態擴張", "最低維持率", "期末淨資產(萬)", "期末總資產(萬)", "理論含息年化(%)", "真實淨資產年化(%)", "單純價差年化(%)", "年化配息率(%)", "填息成功率", "平均填息天數", "年化波動率(%)", "最大回撤(%)", "夏普值", "配息 CV"]
             comparison_df = pd.DataFrame(display_data).set_index("標的名稱")
-            # 過濾掉可能遺漏的欄位
             comparison_df = comparison_df[[c for c in ordered_cols if c in comparison_df.columns]]
             
             def render_html_table(df):
@@ -358,36 +341,39 @@ if selected_names:
 
             st.markdown(render_html_table(comparison_df), unsafe_allow_html=True)
             
+            # --- 批次刪除面板 ---
             if st.session_state.saved_portfolios:
                 st.write("")
-                del_col1, del_col2 = st.columns([3, 1])
-                with del_col1:
-                    options = [f"第 {i+1} 筆: {p['metrics']['標的名稱']}" for i, p in enumerate(st.session_state.saved_portfolios)]
-                    selected_del = st.selectbox("選擇要刪除的歷史紀錄", options, label_visibility="collapsed")
-                with del_col2:
-                    if st.button("🗑️ 刪除選取的紀錄", use_container_width=True):
-                        idx_to_del = int(selected_del.split(":")[0].replace("第 ", "").replace(" 筆", "")) - 1
-                        st.session_state.saved_portfolios.pop(idx_to_del)
-                        st.rerun()
+                with st.expander("🗑️ 管理與批次刪除歷史紀錄", expanded=False):
+                    with st.form("batch_delete_form"):
+                        st.write("請勾選您想移除的策略紀錄，支援多選批次刪除：")
+                        del_cols = st.columns(2)
+                        to_delete = []
+                        for i, p in enumerate(st.session_state.saved_portfolios):
+                            col = del_cols[i % 2]
+                            if col.checkbox(f"第 {i+1} 筆: {p['metrics']['標的名稱']}", key=f"del_chk_{i}"):
+                                to_delete.append(i)
+                        
+                        submit_del = st.form_submit_button("🗑️ 刪除已勾選紀錄", type="primary")
+                        if submit_del and to_delete:
+                            for idx in sorted(to_delete, reverse=True):
+                                st.session_state.saved_portfolios.pop(idx)
+                            st.rerun()
 
             st.caption("💡 **真實淨資產**為BBD運作結果：配息支付生活費與利息，餘額自動買入配息資產，不足額直接轉化為負債，絕不賣股。")
             st.divider()
 
-            # --- 資金曲線圖 (全面疊合所有歷史紀錄) ---
             st.subheader("📈 競技場：所有儲存組合的真實淨資產比較")
             fig_traj = go.Figure()
             
-            # 1. 畫背景參考線 (理論含息與單純價差)
             fig_traj.add_trace(go.Scatter(x=curr_p_t.index, y=curr_p_t['Net_Theory'], mode='lines', name='[參考] 理論含息 (無視提領/利息)', line=dict(color='#BDC3C7', width=1, dash='dot')))
             fig_traj.add_trace(go.Scatter(x=curr_p_t.index, y=curr_p_t['Net_Static'], mode='lines', name='[參考] 單純價差 (股數不變)', line=dict(color='#7F8C8D', width=1, dash='dash')))
             
-            # 2. 畫出所有儲存的歷史紀錄 (真實淨資產)
             for item in st.session_state.saved_portfolios:
                 name = item['metrics']['標的名稱']
                 traj = item['traj']
                 fig_traj.add_trace(go.Scatter(x=traj.index, y=traj['Net_Real'], mode='lines', name=name, line=dict(width=1.5)))
 
-            # 3. 畫出當前預覽的真實淨資產 (加粗)
             fig_traj.add_trace(go.Scatter(x=curr_p_t.index, y=curr_p_t['Net_Real'], mode='lines', name=f'👁️預覽: {custom_name} (無質押)', line=dict(width=3, color='#2ECC71')))
             if leverage_pct > 0:
                 rebalance_tag = " [動態擴張]" if enable_rebalance else " [不還本]"
@@ -396,13 +382,11 @@ if selected_names:
             fig_traj.update_layout(hovermode="x unified", yaxis_title="淨資產金額 (元)", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
             st.plotly_chart(fig_traj, use_container_width=True, key="traj_chart_main")
             
-            # --- 維持率圖表 ---
             st.subheader("🚨 質押維持率壓力監測競技場")
             fig_margin = go.Figure()
             has_margin_data = False
             
             for item in st.session_state.saved_portfolios:
-                # 使用安全讀取 .get() 避免舊紀錄引發 KeyError
                 if item.get('metrics', {}).get('質押標籤', '原型') == "質押":
                     name = item['metrics']['標的名稱']
                     traj = item['traj']
