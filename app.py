@@ -348,7 +348,7 @@ with st.sidebar:
 
     st.divider()
     st.header("🎯 5. AI 尋優防禦底線設定")
-    ai_min_margin = st.number_input("股災最低容許維持率 (%)", min_value=140, max_value=500, value=250, step=10, help="歷史回測中若維持率跌破此數值，AI 將淘汰該策略。建議 >200% 以保證安穩好眠。")
+    ai_min_margin = st.number_input("股災最低容許維持率 (%)", min_value=140, max_value=500, value=350, step=10, help="歷史回測中若維持率跌破此數值，AI 將淘汰該策略。建議 >300% 以保證安穩好眠。")
 
 # ==========================================
 # 5. 主畫面運算與渲染
@@ -555,6 +555,16 @@ if selected_names:
 
             st.markdown(render_html_table(comparison_df), unsafe_allow_html=True)
             
+            with st.expander("📊 績效指標說明辭典 (點擊展開)", expanded=False):
+                st.markdown(f"""
+                * 📌 **基準對照：此區間內，台股大盤(^TWII)的最大歷史回撤為 {market_mdd*100:.2f}%**
+                * **組合 Beta**：測量資產防禦力的絕對指標。Beta = 0.7 代表大盤跌 10% 時，此組合原形通常只跌 7%。
+                * **最大回撤 (%)**：圖表上顯示的是**真實淨資產**的回撤。它包含了「ETF下跌 + 槓桿放大 + 提領抽血」的三重打擊，代表您帳戶真實經歷的最痛縮水幅度。
+                * **最低維持率**：遭遇歷史股災最差狀況時的維持率。小於 130% 代表策略失敗已遭券商斷頭。
+                * **真實淨資產年化 (%)**：**核心指標！** BBD 帳戶真實運作：自動扣除生活費/利息，餘額買股、不足借款的真實身價成長率。
+                * **理論夏普值** vs **真實夏普值**：前者代表資產原來的優劣；後者代表扛下提領壓力後，真實入袋的 CP 值。
+                """)
+
             if st.session_state.saved_portfolios:
                 st.write("")
                 with st.expander("🗑️ 管理與批次刪除歷史紀錄", expanded=False):
@@ -649,23 +659,20 @@ if selected_names:
                         _, _, _, y_raw = get_portfolio_yield_cv(selected_tickers, df_price, div_raw_dict, w, 0, borrow_rate)
                         Y = y_raw
                         
-                        # 1. 計算剛性現金流損平點 (Breakeven Leverage)
                         if C * Y >= E:
                             d_min = 0
                             lev_min = 0
                             margin_max = float('inf')
                         else:
                             if Y <= R:
-                                continue # 殖利率低於借款利率，且本金配息不夠，陷入死胡同
+                                continue 
                             d_min = (E - C * Y) / (Y - R)
                             lev_min = (d_min / C) * 100
                             margin_max = ((1 + lev_min/100) / (lev_min/100)) * 100
                         
-                        # 2. 建立測試網格 (只測試能產生正現金流，且高於防禦底線的維持率)
                         test_margins = [250, 300, 350, 400, 450, 500, 600, 800]
                         valid_margins = [m for m in test_margins if m >= ai_min_margin and m <= margin_max]
                         
-                        # 把最完美的損平點 (剛好及格的最高維持率) 也加進去測
                         if margin_max != float('inf') and margin_max >= ai_min_margin:
                             if margin_max not in valid_margins:
                                 valid_margins.append(margin_max)
@@ -674,7 +681,7 @@ if selected_names:
                         for m in valid_margins:
                             test_levs.append(100 / (m/100 - 1))
                             
-                        test_levs = list(set(test_levs)) # 去重複
+                        test_levs = list(set(test_levs)) 
                         
                         for lev in test_levs:
                             margin_target = ((1 + lev/100) / (lev/100)) * 100 if lev > 0 else float('inf')
@@ -684,7 +691,6 @@ if selected_names:
                             if raw['min_maintenance'] >= ai_min_margin and raw['final_net_real'] > initial_capital:
                                 w_str = " + ".join([f"{name[:5]} {w[i]*100:.0f}%" for i, name in enumerate(selected_names) if w[i] > 0])
                                 
-                                # 再次計算確認首年現金流
                                 est_div = (C * (1 + lev/100)) * Y
                                 est_int = (C * (lev/100)) * R
                                 net_cf = est_div - est_int - E
