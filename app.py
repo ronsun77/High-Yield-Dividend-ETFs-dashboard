@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
 # ==========================================
-# 1. 網頁基本設定 & 暫存狀態初始化
+# 1. 網頁設定 & 暫存初始化
 # ==========================================
 st.set_page_config(page_title="高股息策略與質押模擬器", layout="wide")
 st.title("🛡️ 台灣高股息 ETF 現金流組合與質押模擬器")
@@ -26,13 +26,13 @@ DEFAULT_ETF_DICT = {
 }
 
 # ==========================================
-# 2. 資料抓取與輔助函數 (修正還原權息演算法)
+# 2. 資料抓取與手動還原引擎 (核心修正)
 # ==========================================
 @st.cache_data(ttl=3600)
-def load_all_data(tickers, start_date, end_date):
+def load_and_reconstruct_data(tickers, start_date, end_date):
     """
-    一次性抓取原始價格與配息，並手動計算含息總報酬(Total Return)與不含息價格報酬(Price Return)。
-    強制對齊所有標的的最晚起始日，確保同期比較。
+    抓取原始價格，並利用除息紀錄，手動計算出精確的「含息還原價(Total Return)」。
+    徹底解決 yfinance 台股資料含息/不含息相同的問題。
     """
     if not tickers: return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {}
     
@@ -41,57 +41,52 @@ def load_all_data(tickers, start_date, end_date):
     
     for ticker in tickers:
         try:
-            # 抓取原始價格 (auto_adjust=False 確保不被提前還原)
-            tk = yf.Ticker(ticker)
-            hist = tk.history(start=start_date, end=end_date, auto_adjust=False)
-            if not hist.empty and 'Close' in hist.columns:
-                hist.index = hist.index.tz_localize(None)
-                raw_prices[ticker] = hist['Close']
+            # 強制抓取未還原的原始收盤價 (Price Return)
+            df = yf.download(ticker, start=start_date, end=end_date, progress=False, auto_adjust=False)
+            if not df.empty:
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                if 'Close' in df.columns:
+                    df.index = df.index.tz_localize(None)
+                    raw_prices[ticker] = df['Close']
             
-            # 抓取配息
+            # 抓取配息紀錄
+            tk = yf.Ticker(ticker)
             divs = tk.dividends
             if not divs.empty:
                 divs.index = divs.index.tz_localize(None)
-                # 過濾出在我們回測區間內的配息
-                valid_divs = divs[(divs.index >= pd.Timestamp(start_date)) & (divs.index <= pd.Timestamp(end_date))]
-                div_raw_dict[ticker] = valid_divs
-                
+                div_raw_dict[ticker] = divs[(divs.index >= pd.Timestamp(start_date)) & (divs.index <= pd.Timestamp(end_date))]
         except Exception:
             continue
             
-    df_price = pd.DataFrame(raw_prices).dropna() # 取交集，強制同期對齊
+    df_price = pd.DataFrame(raw_prices).dropna() # 取交集對齊時間
     if df_price.empty: return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {}
     
-    # 建立含息還原價格矩陣 (手動計算 Total Return Index)
+    # === 手動建構含息還原價格 (Total Return Index) ===
     df_adj = df_price.copy()
     for ticker in df_price.columns:
         divs = div_raw_dict.get(ticker, pd.Series(dtype=float))
         adj_series = df_price[ticker].copy()
-        for ex_date, div_amt in divs.items():
+        
+        # 從最後一天往回算，遇到除息日，就將除息日「之前」的所有價格向下調整
+        # 這樣才能算出真實的複利總報酬
+        sorted_divs = divs.sort_index(ascending=False)
+        for ex_date, div_amt in sorted_divs.items():
             if ex_date in adj_series.index:
-                # 找到除息前一天的收盤價
                 pre_dates = adj_series.index[adj_series.index < ex_date]
                 if not pre_dates.empty:
                     pre_date = pre_dates[-1]
-                    pre_price = adj_series.loc[pre_date]
-                    # 計算還原係數
-                    adj_factor = pre_price / (pre_price - div_amt)
-                    # 將除息日之前的價格全部往下調整 (yfinance 標準做法)
-                    adj_series.loc[:pre_date] = adj_series.loc[:pre_date] / adj_factor
+                    pre_price_raw = df_price[ticker].loc[pre_date] # 使用原始價格計算比例
+                    if pre_price_raw > div_amt:
+                        adj_factor = (pre_price_raw - div_amt) / pre_price_raw
+                        adj_series.loc[:pre_date] = adj_series.loc[:pre_date] * adj_factor
+                        
         df_adj[ticker] = adj_series
         
-    # 計算年度配息總和用於 CV 與殖利率
-    div_annual_dict = {}
-    for ticker, divs in div_raw_dict.items():
-        if not divs.empty:
-            div_annual_dict[ticker] = divs.groupby(divs.index.year).sum()
+    div_annual_dict = {ticker: divs.groupby(divs.index.year).sum() for ticker, divs in div_raw_dict.items() if not divs.empty}
     df_div_annual = pd.DataFrame(div_annual_dict).fillna(0)
     
     return df_adj, df_price, df_div_annual, div_raw_dict
-
-def calculate_mdd(cum_returns):
-    running_max = cum_returns.cummax()
-    return ((cum_returns - running_max) / running_max).min()
 
 def calculate_fill_rate(div_series_dict, price_series, ticker):
     if div_series_dict is None or ticker not in div_series_dict or price_series is None or price_series.empty:
@@ -110,9 +105,8 @@ def calculate_fill_rate(div_series_dict, price_series, ticker):
         
         filled_dates = post_ex_prices[post_ex_prices >= pre_ex_price].index
         if not filled_dates.empty:
-            fill_date = filled_dates[0]
             success_count += 1
-            total_days += (fill_date - ex_date).days
+            total_days += (filled_dates[0] - ex_date).days
             valid_divs += 1
             
     if valid_divs == 0: return "N/A", "N/A"
@@ -124,9 +118,12 @@ def calculate_fill_rate(div_series_dict, price_series, ticker):
 def calculate_metrics_and_trajectory(adj_returns, price_returns, name, leverage_pct, div_series, price_series, borrow_rate, initial_capital, annual_expense, div_raw_dict, ticker_for_fill_rate=None):
     lev_ratio = leverage_pct / 100.0
     daily_borrow_rate = borrow_rate / 252
+    
+    # 槓桿組合日報酬
+    lev_adj_returns = adj_returns * (1 + lev_ratio) - (daily_borrow_rate * lev_ratio)
     lev_price_returns = price_returns * (1 + lev_ratio) - (daily_borrow_rate * lev_ratio)
     
-    # --- 模擬真實資產軌跡 ---
+    # 模擬提領軌跡與維持率
     total_assets = initial_capital * (1 + lev_ratio)
     debt = initial_capital * lev_ratio
     net_assets = initial_capital
@@ -159,16 +156,25 @@ def calculate_metrics_and_trajectory(adj_returns, price_returns, name, leverage_
             
         total_assets = total_assets * (1 + ret)
         net_assets = total_assets - debt
-        trajectory.append({'Date': date, 'Net_Assets': net_assets})
+        
+        # 計算當日維持率 = 總資產 / 融資金額
+        maintenance_margin = (total_assets / debt * 100) if debt > 0 else float('inf')
+        
+        trajectory.append({'Date': date, 'Net_Assets': net_assets, 'Maintenance_Margin': maintenance_margin})
         
     traj_df = pd.DataFrame(trajectory).set_index('Date')
     
-    # --- 計算指標 ---
-    cagr_adj = ((1 + adj_returns).prod() ** (252 / len(adj_returns))) - 1 if not adj_returns.empty else 0
-    cagr_price = ((1 + price_returns).prod() ** (252 / len(price_returns))) - 1 if not price_returns.empty else 0
-    volatility = adj_returns.std() * np.sqrt(252) if not adj_returns.empty else 0
+    # 指標計算
+    cagr_adj = ((1 + lev_adj_returns).prod() ** (252 / len(lev_adj_returns))) - 1 if not lev_adj_returns.empty else 0
+    cagr_price = ((1 + lev_price_returns).prod() ** (252 / len(lev_price_returns))) - 1 if not lev_price_returns.empty else 0
+    volatility = lev_adj_returns.std() * np.sqrt(252) if not lev_adj_returns.empty else 0
     sharpe_ratio = (cagr_adj - 0.015) / volatility if volatility != 0 else 0
-    mdd = calculate_mdd((1 + adj_returns).cumprod()) if not adj_returns.empty else 0
+    
+    cum_adj = (1 + lev_adj_returns).cumprod()
+    running_max = cum_adj.cummax()
+    mdd = ((cum_adj - running_max) / running_max).min() if not lev_adj_returns.empty else 0
+    
+    min_maintenance = traj_df['Maintenance_Margin'].min() if not traj_df.empty and debt > 0 else float('inf')
     
     cv_str, yield_val, fill_rate_str, fill_days_str = "N/A", "N/A", "N/A", "N/A"
     
@@ -189,15 +195,16 @@ def calculate_metrics_and_trajectory(adj_returns, price_returns, name, leverage_
     metrics = {
         "標的名稱": name,
         "質押": f"{leverage_pct}%",
-        "期末淨資產 (萬)": f"{net_assets / 10000:.2f}",
-        "期末總資產 (萬)": f"{total_assets / 10000:.2f}",
-        "含息年化 (%)": f"{cagr_adj * 100:.2f}",
-        "不含息年化 (%)": f"{cagr_price * 100:.2f}",
-        "年化配息率 (%)": yield_val,
+        "最低維持率": f"{min_maintenance:.0f}%" if min_maintenance != float('inf') else "N/A",
+        "期末淨資產(萬)": f"{net_assets / 10000:.2f}",
+        "期末總資產(萬)": f"{total_assets / 10000:.2f}",
+        "含息年化(%)": f"{cagr_adj * 100:.2f}",
+        "不含息年化(%)": f"{cagr_price * 100:.2f}",
+        "年化配息率(%)": yield_val,
         "填息成功率": fill_rate_str,
         "平均填息天數": fill_days_str,
-        "年化波動率 (%)": f"{volatility * 100:.2f}",
-        "最大回撤 (%)": f"{mdd * 100:.2f}",
+        "年化波動率(%)": f"{volatility * 100:.2f}",
+        "最大回撤(%)": f"{mdd * 100:.2f}",
         "夏普值": f"{sharpe_ratio:.2f}",
         "配息 CV": cv_str
     }
@@ -221,7 +228,6 @@ with st.sidebar:
     
     st.header("⚖️ 3. 資產與權重")
     current_etf_dict = {**DEFAULT_ETF_DICT, **st.session_state.custom_etfs}
-    
     with st.expander("➕ 新增自訂 ETF"):
         new_etf_code = st.text_input("輸入台股代碼 (例: 006208)")
         new_etf_name = st.text_input("輸入顯示名稱 (例: 006208 富邦台50)")
@@ -232,7 +238,6 @@ with st.sidebar:
                 st.rerun()
                 
     selected_names = st.multiselect("選擇組成 ETF", list(current_etf_dict.keys()), default=["00713 元大台灣高息低波", "00878 國泰永續高股息"])
-    
     weights = []
     if selected_names:
         default_w = 100 // len(selected_names)
@@ -243,7 +248,19 @@ with st.sidebar:
             
     st.divider()
     st.header("🔥 4. 質押槓桿設定")
-    leverage_pct = st.slider("質押借款比例 (%)", 0, 100, 20)
+    
+    # 支援兩種輸入方式互換
+    leverage_mode = st.radio("設定方式", ["依借款比例", "依目標維持率"])
+    if leverage_mode == "依借款比例":
+        leverage_pct = st.slider("質押借款比例 (%)", 0, 100, 20)
+        target_margin = ((1 + leverage_pct/100) / (leverage_pct/100) * 100) if leverage_pct > 0 else float('inf')
+        if leverage_pct > 0:
+            st.caption(f"推算初始維持率約為: {target_margin:.0f}%")
+    else:
+        target_margin = st.number_input("目標初始維持率 (%)", min_value=130, max_value=1000, value=166, step=10)
+        leverage_pct = round(100 / (target_margin/100 - 1)) if target_margin > 100 else 0
+        st.caption(f"推算需借款比例約為: {leverage_pct}%")
+        
     borrow_rate = st.number_input("借款年利率 (%)", value=2.5, step=0.1) / 100.0
 
 # ==========================================
@@ -251,11 +268,11 @@ with st.sidebar:
 # ==========================================
 if selected_names:
     if sum(weights) != 1.0:
-        st.error(f"⚠️ 目前權重總和為 {sum(weights)*100:.0f}%，請調整至 100%。")
+        st.error(f"⚠️ 權重總和需為 100%，目前為 {sum(weights)*100:.0f}%")
     else:
         selected_tickers = [current_etf_dict[name] for name in selected_names]
-        with st.spinner("載入報價與重建還原權息模型中..."):
-            df_adj, df_price, df_div_annual, df_div_raw = load_all_data(selected_tickers, start_date, end_date)
+        with st.spinner("載入報價並手動還原真實股息模型中..."):
+            df_adj, df_price, df_div_annual, df_div_raw = load_and_reconstruct_data(selected_tickers, start_date, end_date)
             
         if not df_adj.empty and not df_price.empty:
             actual_start = df_adj.index[0].strftime('%Y-%m-%d')
@@ -270,12 +287,12 @@ if selected_names:
             port_div_series = None
             port_price_series_for_yield = None
             if not df_div_annual.empty:
-                valid_div_cols = [c for c in df_div_annual.columns if c in selected_tickers]
-                if valid_div_cols:
-                    port_div_series = (df_div_annual[valid_div_cols] * [weights[selected_tickers.index(c)] for c in valid_div_cols]).sum(axis=1)
-                    port_price_series_for_yield = (df_price[valid_div_cols] * [weights[selected_tickers.index(c)] for c in valid_div_cols]).sum(axis=1)
+                valid_cols = [c for c in df_div_annual.columns if c in selected_tickers]
+                if valid_cols:
+                    port_div_series = (df_div_annual[valid_cols] * [weights[selected_tickers.index(c)] for c in valid_cols]).sum(axis=1)
+                    port_price_series_for_yield = (df_price[valid_cols] * [weights[selected_tickers.index(c)] for c in valid_cols]).sum(axis=1)
             
-            # --- 儲存按鈕區塊 ---
+            # --- 儲存區塊 ---
             st.subheader("💾 命名與保存當前策略")
             col_name, col_btn = st.columns([3, 1])
             with col_name:
@@ -284,18 +301,17 @@ if selected_names:
                 if st.button("➕ 記錄至績效比較表", type="primary", use_container_width=True):
                     p_metrics, p_traj = calculate_metrics_and_trajectory(port_adj_returns, port_price_returns, f"🎯 {custom_name} (原型)", 0, port_div_series, port_price_series_for_yield, borrow_rate, initial_capital, annual_expense, df_div_raw)
                     st.session_state.saved_portfolios.append({"metrics": p_metrics, "traj": p_traj})
-                    
                     if leverage_pct > 0:
                         l_metrics, l_traj = calculate_metrics_and_trajectory(port_adj_returns, port_price_returns, f"🔥 {custom_name} (質押)", leverage_pct, port_div_series, port_price_series_for_yield, borrow_rate, initial_capital, annual_expense, df_div_raw)
                         st.session_state.saved_portfolios.append({"metrics": l_metrics, "traj": l_traj})
             st.divider()
 
             # --- 績效比較表 ---
-            st.subheader(f"📋 績效比較表 (同期比較基準: {actual_start} 至 {actual_end})")
+            st.subheader(f"📋 績效比較表 (同期基準: {actual_start} 至 {actual_end})")
             
             display_data = []
             
-            # 1. 單一 ETF
+            # 1. 單一 ETF (無槓桿基準)
             for col in adj_returns.columns:
                 etf_name = [k for k, v in current_etf_dict.items() if v == col][0]
                 etf_div_series = df_div_annual[col] if col in df_div_annual.columns else None
@@ -304,7 +320,7 @@ if selected_names:
                 display_data.append(m)
                 
             # 2. 歷史紀錄
-            for idx, item in enumerate(st.session_state.saved_portfolios):
+            for item in st.session_state.saved_portfolios:
                 display_data.append(item['metrics'].copy())
                 
             # 3. 當前預覽
@@ -325,17 +341,11 @@ if selected_names:
                     html += f"<th style='padding: 6px; text-align:center;'>{col}</th>"
                 html += "</tr>"
                 for index, row in df.iterrows():
-                    bg_color = "transparent"
-                    font_weight = "normal"
-                    color = "#E0E0E0"
-                    
+                    bg_color, font_weight, color = "transparent", "normal", "#E0E0E0"
                     if str(index).startswith("👁️ 預覽"):
-                        bg_color = "#117A65"
-                        font_weight = "bold"
-                        color = "white"
+                        bg_color, font_weight, color = "#117A65", "bold", "white"
                     elif "🔥" in str(index) or "🎯" in str(index):
-                        bg_color = "#2C3E50"
-                        color = "#D5D8DC"
+                        bg_color, color = "#2C3E50", "#D5D8DC"
                     
                     html += f"<tr style='background-color: {bg_color}; border-bottom: 1px solid #333;'>"
                     html += f"<td style='padding: 6px; text-align:left; color:{color}; font-weight:{font_weight};'>{index}</td>"
@@ -347,7 +357,6 @@ if selected_names:
 
             st.markdown(render_html_table(comparison_df), unsafe_allow_html=True)
             
-            # --- 刪除特定歷史紀錄介面 ---
             if st.session_state.saved_portfolios:
                 st.write("")
                 del_col1, del_col2 = st.columns([3, 1])
@@ -360,25 +369,32 @@ if selected_names:
                         st.session_state.saved_portfolios.pop(idx_to_del)
                         st.rerun()
 
-            st.caption("💡 **淨資產**為扣除負債後的真實身價。**總資產**包含質押借款。每年年底結算，配息大於生活費則再投入，不足則變賣本金。")
+            st.caption("💡 **最低維持率**評估抗斷頭能力。**不含息年化**代表純價格成長。皆為扣除生活費與利息後之真實模擬。")
             st.divider()
 
-            # --- 資金曲線 ---
-            st.subheader("📈 真實提領軌跡預覽 (包含再投入與變賣本金)")
+            # --- 雙圖表區塊 ---
+            tab_traj, tab_margin = st.tabs(["📉 真實提領軌跡預覽", "🚨 質押維持率壓力監測"])
             
-            fig_traj = go.Figure()
-            fig_traj.add_trace(go.Scatter(x=curr_p_t.index, y=curr_p_t['Net_Assets'], mode='lines', name='🎯 當前組合淨資產 (未槓桿)', line=dict(color='#2E86C1', width=2)))
-            if leverage_pct > 0:
-                fig_traj.add_trace(go.Scatter(x=curr_l_t.index, y=curr_l_t['Net_Assets'], mode='lines', name=f'🔥 當前組合淨資產 (質押 {leverage_pct}%)', line=dict(color='#E74C3C', width=2)))
-            
-            fig_traj.update_layout(
-                hovermode="x unified", 
-                yaxis_title="淨資產金額 (元)", 
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-            )
-            
-            st.plotly_chart(fig_traj, use_container_width=True, key="traj_chart_main")
-            st.info(f"👆 這張圖展示了在每年需提領 **{annual_expense} 元**生活費的壓力下，你的淨資產是持續成長（配息 > 生活費，自動再投入）還是逐漸枯竭（配息不足，被迫變賣本金）。")
+            with tab_traj:
+                fig_traj = go.Figure()
+                fig_traj.add_trace(go.Scatter(x=curr_p_t.index, y=curr_p_t['Net_Assets'], mode='lines', name='🎯 當前組合淨資產 (未槓桿)', line=dict(color='#2E86C1', width=2)))
+                if leverage_pct > 0:
+                    fig_traj.add_trace(go.Scatter(x=curr_l_t.index, y=curr_l_t['Net_Assets'], mode='lines', name=f'🔥 當前組合淨資產 (質押 {leverage_pct}%)', line=dict(color='#E74C3C', width=2)))
+                fig_traj.update_layout(hovermode="x unified", yaxis_title="淨資產金額 (元)", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+                st.plotly_chart(fig_traj, use_container_width=True, key="traj_chart_main")
+                
+            with tab_margin:
+                if leverage_pct > 0:
+                    fig_margin = go.Figure()
+                    fig_margin.add_trace(go.Scatter(x=curr_l_t.index, y=curr_l_t['Maintenance_Margin'], mode='lines', name='當日維持率 (%)', line=dict(color='#F1C40F', width=2)))
+                    # 畫警戒線
+                    fig_margin.add_hline(y=166, line_dash="dash", line_color="orange", annotation_text="166% (追繳警戒線)", annotation_position="bottom right")
+                    fig_margin.add_hline(y=130, line_dash="solid", line_color="red", annotation_text="130% (斷頭死亡線)", annotation_position="bottom right")
+                    
+                    fig_margin.update_layout(hovermode="x unified", yaxis_title="維持率 (%)", yaxis=dict(range=[100, max(300, curr_l_t['Maintenance_Margin'].max() * 1.1)]))
+                    st.plotly_chart(fig_margin, use_container_width=True, key="margin_chart_main")
+                else:
+                    st.info("未開啟質押槓桿，無維持率風險。")
                 
         else:
             st.warning("資料獲取失敗，請確認時間區間內是否有足夠報價。")
