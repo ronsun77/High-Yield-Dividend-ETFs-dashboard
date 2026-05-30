@@ -107,18 +107,34 @@ def get_portfolio_yield_cv(tickers, df_price, div_raw_dict, weights, leverage_pc
         
     return no_lev_str, lev_str, cv_str, port_base_yield
 
-# 生成權重組合矩陣 (Grid Search 專用)
+# --- 新增：將單一押注 (100%) 也加入尋優網格 ---
 def generate_weight_combinations(num_assets, step_pct=10):
     step = step_pct / 100.0
-    def helper(n, target):
-        if n == 1: return [[target]]
-        res = []
-        for i in range(int(round(target/step)) + 1):
-            val = round(i * step, 2)
-            for rest in helper(n-1, round(target - val, 2)):
-                res.append([val] + rest)
-        return res
-    return helper(num_assets, 1.0)
+    res = []
+    
+    # 1. 先加入所有單一押注的極端情況 (100% 押注單一檔)
+    for i in range(num_assets):
+        w = [0.0] * num_assets
+        w[i] = 1.0
+        res.append(w)
+        
+    # 2. 加入複合組合
+    if num_assets > 1:
+        def helper(n, target):
+            if n == 1: return [[target]]
+            temp_res = []
+            for i in range(int(round(target/step)) + 1):
+                val = round(i * step, 2)
+                for rest in helper(n-1, round(target - val, 2)):
+                    temp_res.append([val] + rest)
+            return temp_res
+        
+        combinations = helper(num_assets, 1.0)
+        for combo in combinations:
+            if combo not in res: # 避免重複
+                res.append(combo)
+                
+    return res
 
 # ==========================================
 # 3. 真實 BBD 提領模擬器
@@ -234,12 +250,11 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
     mdd = ((cum_real - running_max) / running_max).min() if not cum_real.empty else 0
     
     min_maintenance = traj_df['Maintenance_Margin'].min() if debt_real > 0 else float('inf')
-    
     rebalance_status = "開啟" if enable_rebalance and leverage_pct > 0 else "-"
+    
     final_net_real = traj_df['Net_Real'].iloc[-1]
     final_total_assets = final_net_real + debt_real
     
-    # 輸出原始數值供 AI 尋優
     raw_metrics = {
         "final_net_real": final_net_real,
         "cagr_real": cagr_real,
@@ -315,7 +330,7 @@ with st.sidebar:
         enable_rebalance = st.checkbox("⚙️ 恆定維持率策略", value=False, help="每年底檢視：維持率超過設定值時，增加質押借款買入資產；低於設定值時，不做任何動作(絕不賣股)。")
 
     st.divider()
-    st.header("🛡️ 戰略評估與斷頭風險試算")
+    st.header("🛡️ 戰略評估與大盤容許跌幅試算")
     if leverage_pct > 0:
         debt_amt = initial_capital * (leverage_pct / 100)
         total_amt = initial_capital + debt_amt
@@ -327,15 +342,20 @@ with st.sidebar:
         total_liability = annual_expense + annual_interest
         breakeven_yield = (total_liability / total_amt) * 100
         
-        st.info(f"""
-        **🚨 容許大盤最大跌幅 (安全邊際)**
-        * 跌至 166% (追繳)：跌幅約 **-{drop_to_166:.1f}%**
-        * 跌至 130% (斷頭)：跌幅約 **-{drop_to_130:.1f}%**
+        # 加入 Beta 折算，以 0.8 作為防禦型 ETF 的大盤概估連動係數
+        est_beta = 0.8 
+        market_drop_130 = drop_to_130 / est_beta
         
-        **⚖️ 現金流損平分析**
-        * 每年生活費：{annual_expense/10000:.1f} 萬
-        * 每年預估利息：{annual_interest/10000:.1f} 萬
-        * 總資產損平殖利率需達：**{breakeven_yield:.2f}%**
+        st.info(f"""
+        **🚨 本組合最大容許跌幅**
+        * 組合淨值跌 **-{drop_to_166:.1f}%** 將面臨追繳 (166%)
+        * 組合淨值跌 **-{drop_to_130:.1f}%** 將遭斷頭 (130%)
+        
+        *(若假設組合 Beta 為 {est_beta}，代表**大盤需崩跌約 -{market_drop_130:.1f}%** 才會讓您的組合跌到斷頭線)*
+        
+        **⚖️ 損平殖利率安全檢測**
+        * 每年提領與利息總需：{(total_liability)/10000:.1f} 萬
+        * 總資產需有 **{breakeven_yield:.2f}%** 殖利率才能不傷本。
         """)
     else:
         st.info("無質押，資產絕對安全 (無斷頭風險)。\n* 但需承擔股息不足時變賣本金的風險。")
@@ -373,9 +393,9 @@ if selected_names:
                 col3.metric("預估利息支出", f"-{est_interest/10000:.1f} 萬")
                 
                 if net_cash >= 0:
-                    col4.metric("💰 預估年底可買股餘額", f"+{net_cash/10000:.1f} 萬", "正向循環")
+                    col4.metric("💰 年底可擴張買股餘額", f"+{net_cash/10000:.1f} 萬", "正向循環")
                 else:
-                    col4.metric("🩸 預估年底需借款缺口", f"{net_cash/10000:.1f} 萬", "失血負債", delta_color="inverse")
+                    col4.metric("🩸 年底需再借款缺口", f"{net_cash/10000:.1f} 萬", "不賣股轉負債", delta_color="inverse")
             else:
                 est_div = initial_capital * raw_port_yield
                 net_cash = est_div - annual_expense
@@ -384,9 +404,9 @@ if selected_names:
                 col1.metric("預估總股息收入", f"{est_div/10000:.1f} 萬")
                 col2.metric("生活費提領", f"-{annual_expense/10000:.1f} 萬")
                 if net_cash >= 0:
-                    col3.metric("💰 預估年底可買股餘額", f"+{net_cash/10000:.1f} 萬", "正向循環")
+                    col3.metric("💰 年底可擴張買股餘額", f"+{net_cash/10000:.1f} 萬", "正向循環")
                 else:
-                    col3.metric("🩸 預估年底被迫變賣本金", f"{net_cash/10000:.1f} 萬", "萎縮風險", delta_color="inverse")
+                    col3.metric("🩸 年底被迫變賣本金", f"{net_cash/10000:.1f} 萬", "萎縮風險", delta_color="inverse")
             st.divider()
 
             st.subheader("💾 命名與保存當前策略")
@@ -590,26 +610,24 @@ if selected_names:
                 st.plotly_chart(fig_margin, use_container_width=True, key="margin_chart_main")
             else:
                 st.info("目前清單中沒有包含質押槓桿的策略，無維持率風險。")
-                
+
             # ==========================================
-            # 6. AI 權重與參數網格尋優 (Grid Search)
+            # 6. AI 權重與單一押注網格尋優 (Grid Search)
             # ==========================================
             st.divider()
             st.subheader("🎯 系統判斷與最佳化配比建議 (AI 動態尋優)")
-            with st.expander("點擊展開多維度尋優矩陣 (運算包含 ETF 權重與維持率交乘，需等待約 5~10 秒)", expanded=False):
-                with st.spinner("AI 正在背景測試數百種權重與維持率組合..."):
+            with st.expander("點擊展開多維度尋優矩陣 (包含單一 ETF 押注與複合配置，運算需等待數秒)", expanded=False):
+                with st.spinner("AI 正在背景測試包含「單一重壓」在內的數百種權重與維持率組合..."):
                     num_assets = len(selected_tickers)
-                    # 依據標的數量動態調整網格精細度，避免組合爆炸導致當機
                     step_pct = 10 if num_assets <= 3 else (20 if num_assets == 4 else 25)
                     weight_grids = generate_weight_combinations(num_assets, step_pct)
                     
-                    # 尋優清單
                     best_sharpe_list = []
                     best_mdd_list = []
                     best_net_list = []
                     
                     # 將維持率反向推算為借款比例
-                    margin_targets = [200, 250, 300, 350, 400, 500]
+                    margin_targets = [200, 250, 300, 350, 400, 450, 500]
                     leverage_targets = [round(100 / (m/100 - 1)) for m in margin_targets]
                     
                     for w in weight_grids:
@@ -620,7 +638,7 @@ if selected_names:
                             
                             # 篩選存活條件
                             if raw['min_maintenance'] > 140 and raw['final_net_real'] > initial_capital:
-                                w_str = " + ".join([f"{name[:5]} {w[i]*100:.0f}%" for i, name in enumerate(selected_names)])
+                                w_str = " + ".join([f"{name[:5]} {w[i]*100:.0f}%" for i, name in enumerate(selected_names) if w[i] > 0])
                                 result = {
                                     "w_str": w_str,
                                     "lev": lev,
@@ -634,27 +652,26 @@ if selected_names:
                                 best_mdd_list.append(result)
                                 best_net_list.append(result)
                                 
-                    # 排序取出 Top 3
                     best_sharpe_list.sort(key=lambda x: x['sharpe'], reverse=True)
-                    best_mdd_list.sort(key=lambda x: x['mdd'], reverse=True) # mdd 是負數，越大代表跌越少
+                    best_mdd_list.sort(key=lambda x: x['mdd'], reverse=True) 
                     best_net_list.sort(key=lambda x: x['net'], reverse=True)
                     
-                    st.markdown(f"系統已根據您選擇的 **{actual_start} ~ {actual_end}** 區間進行了數百次的背景網格運算。在 **「保證回測期間內絕對存活 (最低維持率 > 140%)」** 且 **「資產不縮水」** 的雙重前提下，為您找出以下實戰黃金比例：")
+                    st.markdown(f"系統已針對 **{actual_start} ~ {actual_end}** 區間進行背景網格運算。在 **「保證回測期間內絕對存活 (最低維持率 > 140%)」** 且 **「資產不縮水」** 的雙重前提下，為您找出以下實戰黃金比例：")
                     
                     if best_sharpe_list:
-                        st.success("💡 **目標一：更高的 CP 值 (賺得穩)**\n系統演算所有組合，發現以下夏普值最高的黃金配比：")
+                        st.success("🏆 **目標一：綜合王者 (最高 CP 值)**\n系統演算發現，以下設定能在「賺得多」與「跌得少」之間取得最完美平衡：")
                         for i, res in enumerate(best_sharpe_list[:3]):
                             medal = ["🥇 冠軍配比", "🥈 亞軍配比", "🥉 季軍配比"][i]
                             st.write(f"**{medal}：** {res['w_str']} (恆定維持率 {res['margin']}%)")
-                            st.caption(f"模擬成效：真實夏普值達 **{res['sharpe']:.2f}** (年化報酬 {res['cagr']*100:.2f}%)，最大回撤 {res['mdd']*100:.2f}%，在帶有負債的架構下屬頂尖表現。")
+                            st.caption(f"模擬成效：真實夏普值達 **{res['sharpe']:.2f}** (年化報酬 {res['cagr']*100:.2f}%)，最大回撤 {res['mdd']*100:.2f}%。")
                         
-                        st.warning("🛡️ **目標二：更低的最大回撤 (睡得安穩)**\n若您希望在 BBD 架構下盡可能抗跌，以下是系統找出的最強防禦軍：")
+                        st.warning("🛡️ **目標二：絕對防禦 (最小最大回撤)**\n若您希望在 BBD 借款架構下盡可能抗跌，以下是系統找出的最強防禦裝甲 (通常為單一低波資產)：")
                         for i, res in enumerate(best_mdd_list[:3]):
                             medal = ["🥇 冠軍配比", "🥈 亞軍配比", "🥉 季軍配比"][i]
                             st.write(f"**{medal}：** {res['w_str']} (恆定維持率 {res['margin']}%)")
-                            st.caption(f"模擬成效：成功將極限回撤控制在 **{res['mdd']*100:.2f}%**，真實夏普值 {res['sharpe']:.2f}，是所有帶有負債的組合中最抗震的絕對安全選擇。")
+                            st.caption(f"模擬成效：成功將極限回撤控制在 **{res['mdd']*100:.2f}%**，真實夏普值 {res['sharpe']:.2f}，是所有帶有負債的組合中最抗震的安全選擇。")
                         
-                        st.error("🔥 **目標三：極致的最終淨值 (賺得更多)**\n在不增加斷頭風險的前提下，透過「積極動態擴張」，創造更高的絕對獲利：")
+                        st.error("🚀 **目標三：暴力擴張 (極致最終淨值)**\n在不觸發斷頭風險的前提下，透過「積極的恆定維持率動態擴張」，創造最大的絕對獲利：")
                         for i, res in enumerate(best_net_list[:3]):
                             medal = ["🥇 冠軍配比", "🥈 亞軍配比", "🥉 季軍配比"][i]
                             st.write(f"**{medal}：** {res['w_str']} (恆定維持率 {res['margin']}%)")
