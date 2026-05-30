@@ -34,11 +34,10 @@ DEFAULT_ETF_DICT = {
 def load_raw_data(tickers, start_date, end_date):
     if not tickers: return pd.DataFrame(), {}
     
-    # 強制加入大盤指數 ^TWII 以計算 Beta 與市場回撤
     fetch_list = list(set(tickers + ['^TWII']))
-    
     raw_prices = {}
     div_raw_dict = {}
+    
     for ticker in fetch_list:
         try:
             df = yf.download(ticker, start=start_date, end=end_date, progress=False, auto_adjust=False)
@@ -49,7 +48,6 @@ def load_raw_data(tickers, start_date, end_date):
                     df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
                     raw_prices[ticker] = df['Close']
             
-            # 大盤不計配息
             if ticker != '^TWII':
                 tk = yf.Ticker(ticker)
                 divs = tk.dividends
@@ -62,7 +60,6 @@ def load_raw_data(tickers, start_date, end_date):
     return pd.DataFrame(raw_prices).dropna(), div_raw_dict
 
 def get_beta_and_market_mdd(tickers, weights, df_price, market_ticker='^TWII'):
-    """計算組合的原型 Beta 值與大盤同期的最大回撤"""
     if market_ticker not in df_price.columns or not tickers:
         return 1.0, 0.0
     
@@ -74,11 +71,9 @@ def get_beta_and_market_mdd(tickers, weights, df_price, market_ticker='^TWII'):
     port_returns = returns[tickers].dot(weights)
     market_returns = returns[market_ticker]
     
-    # 計算 Beta
     cov_matrix = np.cov(port_returns, market_returns)
     beta = cov_matrix[0, 1] / cov_matrix[1, 1] if cov_matrix[1, 1] != 0 else 1.0
     
-    # 計算大盤 MDD
     cum_market = (1 + market_returns).cumprod()
     running_max = cum_market.cummax()
     market_mdd = ((cum_market - running_max) / running_max).min()
@@ -175,7 +170,6 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
     else:
         target_margin_ratio = (total_initial_assets / initial_debt) if initial_debt > 0 else float('inf')
     
-    # 確保傳入的 df_price 只包含我們要模擬的標的 (排除大盤)
     tickers = [c for c in df_price.columns if c != '^TWII']
     
     shares_theory = {t: (total_initial_assets * weights[i]) / df_price[t].iloc[0] for i, t in enumerate(tickers)}
@@ -377,12 +371,9 @@ if selected_names:
             actual_end = df_price.index[-1].strftime('%Y-%m-%d')
             
             selected_tickers = [current_etf_dict[name] for name in selected_names]
-            
-            # --- 取得動態 Beta 與大盤回撤 ---
             port_beta, market_mdd = get_beta_and_market_mdd(selected_tickers, weights, df_price)
             port_yield_no_lev, port_yield_lev, port_cv, raw_port_yield = get_portfolio_yield_cv(selected_tickers, df_price, div_raw_dict, weights, leverage_pct, borrow_rate)
             
-            # --- 渲染側邊欄戰略評估 (加入大盤 Beta) ---
             with st.sidebar:
                 st.divider()
                 st.header("🛡️ 戰略評估與大盤連動試算")
@@ -646,7 +637,7 @@ if selected_names:
                 st.info("目前清單中沒有包含質押槓桿的策略，無維持率風險。")
 
             # ==========================================
-            # 6. AI 權重與單一押注網格尋優 (Grid Search)
+            # 6. AI 權重與單一押注網格尋優 (手動按鈕解耦版)
             # ==========================================
             st.divider()
             st.subheader("🎯 系統判斷與最佳化配比建議 (AI 動態尋優)")
@@ -701,25 +692,49 @@ if selected_names:
                         col_opt1, col_opt2, col_opt3 = st.columns(3)
                         
                         with col_opt1:
-                            st.subheader("🥇 綜合王者 (高夏普 + 低回撤)")
-                            st.markdown("針對風控與獲利取得最佳平衡點的組合：")
+                            st.info("#### 🥇 綜合王者 (高夏普+低回撤)\n針對風控與獲利取得最佳平衡點的組合：")
                             for i, res in enumerate(best_sharpe_list[:3]):
                                 rank = ["❶ 冠軍", "❷ 亞軍", "❸ 季軍"][i]
-                                st.info(f"**{rank}：{res['w_str']}**\n* 組合 Beta：**{res['beta']:.2f}**\n* 策略：恆定維持率 **{res['margin']}%**\n* 成效：真實夏普 **{res['sharpe']:.2f}** / 回撤 **{res['mdd']*100:.2f}%**\n* 🛡️ 最低維持率：**{res['min_margin']:.0f}%**")
+                                st.markdown(f"""
+                                <div style="font-size: 1.15em; line-height: 1.6; padding-bottom: 10px;">
+                                    <span style="font-size: 1.2em; font-weight: bold; color: #5DADE2;">{rank}：{res['w_str']}</span><br>
+                                    • <b>組合 Beta：</b> {res['beta']:.2f}<br>
+                                    • <b>策略：</b> 恆定維持率 {res['margin']}%<br>
+                                    • <b>成效：</b> 真實夏普 {res['sharpe']:.2f} / 回撤 {res['mdd']*100:.2f}%<br>
+                                    • 🛡️ <b>最低維持率：</b> {res['min_margin']:.0f}%
+                                </div>
+                                """, unsafe_allow_html=True)
+                                if i < 2: st.markdown("---")
                         
                         with col_opt2:
-                            st.subheader("🛡️ 絕對防禦 (最大回撤極小化)")
-                            st.markdown("不盲目追求高報酬，以極致抗震、安全存活為首要目標：")
+                            st.warning("#### 🛡️ 絕對防禦 (最大回撤極小化)\n不盲目追求高報酬，以極致抗震、安全存活為首要目標：")
                             for i, res in enumerate(best_mdd_list[:3]):
                                 rank = ["❶ 冠軍", "❷ 亞軍", "❸ 季軍"][i]
-                                st.warning(f"**{rank}：{res['w_str']}**\n* 組合 Beta：**{res['beta']:.2f}**\n* 策略：恆定維持率 **{res['margin']}%**\n* 成效：極限回撤 **{res['mdd']*100:.2f}%** / 真實夏普 **{res['sharpe']:.2f}**\n* 🛡️ 最低維持率：**{res['min_margin']:.0f}%**")
+                                st.markdown(f"""
+                                <div style="font-size: 1.15em; line-height: 1.6; padding-bottom: 10px;">
+                                    <span style="font-size: 1.2em; font-weight: bold; color: #F4D03F;">{rank}：{res['w_str']}</span><br>
+                                    • <b>組合 Beta：</b> {res['beta']:.2f}<br>
+                                    • <b>策略：</b> 恆定維持率 {res['margin']}%<br>
+                                    • <b>成效：</b> 極限回撤 {res['mdd']*100:.2f}% / 真實夏普 {res['sharpe']:.2f}<br>
+                                    • 🛡️ <b>最低維持率：</b> {res['min_margin']:.0f}%
+                                </div>
+                                """, unsafe_allow_html=True)
+                                if i < 2: st.markdown("---")
                         
                         with col_opt3:
-                            st.subheader("🚀 暴力擴張 (期末資產最大化)")
-                            st.markdown("在保證絕對不跌破防禦底線的前提下，榨出最高絕對財富：")
+                            st.error("#### 🚀 暴力擴張 (期末資產最大化)\n在保證不跌破防禦底線前提下，榨出最高絕對財富：")
                             for i, res in enumerate(best_net_list[:3]):
                                 rank = ["❶ 冠軍", "❷ 亞軍", "❸ 季軍"][i]
-                                st.error(f"**{rank}：{res['w_str']}**\n* 組合 Beta：**{res['beta']:.2f}**\n* 策略：恆定維持率 **{res['margin']}%**\n* 成效：期末淨資產 **{res['net']/10000:.0f} 萬** / 年化 **{res['cagr']*100:.2f}%**\n* 🛡️ 最低維持率：**{res['min_margin']:.0f}%**")
+                                st.markdown(f"""
+                                <div style="font-size: 1.15em; line-height: 1.6; padding-bottom: 10px;">
+                                    <span style="font-size: 1.2em; font-weight: bold; color: #EC7063;">{rank}：{res['w_str']}</span><br>
+                                    • <b>組合 Beta：</b> {res['beta']:.2f}<br>
+                                    • <b>策略：</b> 恆定維持率 {res['margin']}%<br>
+                                    • <b>成效：</b> 期末淨資產 {res['net']/10000:.0f} 萬 / 年化 {res['cagr']*100:.2f}%<br>
+                                    • 🛡️ <b>最低維持率：</b> {res['min_margin']:.0f}%
+                                </div>
+                                """, unsafe_allow_html=True)
+                                if i < 2: st.markdown("---")
                     else:
                         st.info(f"在目前的提領壓力與防禦底線 ({ai_min_margin}%) 下，系統無法找到保證存活且不傷本的組合。建議降低提領金額或調降防禦底線標準。")
             else:
