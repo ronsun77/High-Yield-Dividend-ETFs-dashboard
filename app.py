@@ -63,12 +63,25 @@ def get_beta_and_market_mdd(tickers, weights, df_price, market_ticker='^TWII'):
     if market_ticker not in df_price.columns or not tickers:
         return 1.0, 0.0
     
-    aligned_df = df_price[tickers + [market_ticker]].dropna()
+    # 防呆：過濾掉在 df_price 中找不到的 ticker
+    valid_tickers = [t for t in tickers if t in df_price.columns]
+    if not valid_tickers:
+        return 1.0, 0.0
+        
+    aligned_df = df_price[valid_tickers + [market_ticker]].dropna()
     if aligned_df.empty or len(aligned_df) < 2: 
         return 1.0, 0.0
         
+    # 重新對應權重 (確保維度一致)
+    valid_weights = [weights[tickers.index(t)] for t in valid_tickers]
+    total_w = sum(valid_weights)
+    if total_w > 0:
+        valid_weights = [w / total_w for w in valid_weights]
+    else:
+        valid_weights = [1.0 / len(valid_tickers)] * len(valid_tickers)
+        
     returns = aligned_df.pct_change().dropna()
-    port_returns = returns[tickers].dot(weights)
+    port_returns = returns[valid_tickers].dot(valid_weights)
     market_returns = returns[market_ticker]
     
     cov_matrix = np.cov(port_returns, market_returns)
@@ -105,7 +118,7 @@ def get_portfolio_yield_cv(tickers, df_price, div_raw_dict, weights, leverage_pc
     
     for i, t in enumerate(tickers):
         divs = div_raw_dict.get(t, pd.Series(dtype=float))
-        if not divs.empty:
+        if not divs.empty and t in df_price.columns:
             annual_divs = divs.groupby(divs.index.year).sum()
             y_yields = [d / df_price[t][df_price[t].index.year == y].mean() for y, d in annual_divs.items() if not df_price[t][df_price[t].index.year == y].empty]
             avg_yield = np.mean(y_yields) if y_yields else 0.0
@@ -303,7 +316,6 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
 with st.sidebar:
     st.header("💰 1. 資金與提領設定 (全局連動)")
     initial_capital = st.number_input("初始本金 (元)", value=8000000, step=1000000)
-    # 調整生活費需求預設值為 58 萬
     annual_expense = st.number_input("每年生活費需求 (元)", value=580000, step=10000)
     st.divider()
     
@@ -324,7 +336,6 @@ with st.sidebar:
                 st.session_state.custom_etfs[new_etf_name] = ticker_symbol
                 st.rerun()
                 
-    # 預設直接勾選 00713 / 0056 / 00878 三檔 ETF
     selected_names = st.multiselect("選擇組成 ETF", list(current_etf_dict.keys()), default=["00713 元大台灣高息低波", "0056 元大高股息", "00878 國泰永續高股息"])
     weights = []
     if selected_names:
@@ -370,7 +381,27 @@ if selected_names:
             actual_start = df_price.index[0].strftime('%Y-%m-%d')
             actual_end = df_price.index[-1].strftime('%Y-%m-%d')
             
-            selected_tickers = [current_etf_dict[name] for name in selected_names]
+            # --- [修復 KeyError] 報價過濾防護網 ---
+            raw_selected = [current_etf_dict[name] for name in selected_names]
+            valid_selected = []
+            valid_weights = []
+            for t, w in zip(raw_selected, weights):
+                if t in df_price.columns:
+                    valid_selected.append(t)
+                    valid_weights.append(w)
+                    
+            if not valid_selected:
+                st.error("⚠️ 您選擇的所有標的皆無法從 Yahoo Finance 獲取報價，請檢查代碼或網路狀態。")
+                st.stop()
+                
+            if len(valid_selected) < len(raw_selected):
+                missing = set(raw_selected) - set(valid_selected)
+                st.warning(f"⚠️ 以下標的無法獲取報價，系統已暫時排除並重新分配權重：{', '.join(missing)}")
+                
+            selected_tickers = valid_selected
+            weights = [w / sum(valid_weights) for w in valid_weights]
+            # -------------------------------------
+            
             port_beta, market_mdd = get_beta_and_market_mdd(selected_tickers, weights, df_price)
             port_yield_no_lev, port_yield_lev, port_cv, raw_port_yield = get_portfolio_yield_cv(selected_tickers, df_price, div_raw_dict, weights, leverage_pct, borrow_rate)
             
@@ -623,7 +654,7 @@ if selected_names:
                 st.info("目前清單中沒有包含質押槓桿的策略，無維持率風險。")
 
             # ==========================================
-            # 6. AI 權重與單一押注網格尋優 (Grid Search)
+            # 6. AI 權重與單一押注網格尋優 (導入現金流倒推法)
             # ==========================================
             st.divider()
             st.subheader("🎯 系統判斷與最佳化配比建議 (AI 動態尋優)")
