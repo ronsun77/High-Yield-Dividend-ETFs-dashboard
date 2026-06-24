@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 # 1. 網頁設定 & 暫存初始化
 # ==========================================
 st.set_page_config(page_title="高股息策略與質押模擬器", layout="wide")
-st.title("🛡️ 台灣高股息 ETF 買借死 (BBD) 質押模擬器 V9.0")
+st.title("🛡️ 台灣高股息 ETF 買借死 (BBD) 質押模擬器 V9.1")
 
 if 'saved_portfolios' not in st.session_state:
     st.session_state.saved_portfolios = []
@@ -616,6 +616,37 @@ if selected_names:
             if leverage_pct > 0:
                 fig_traj.add_trace(go.Scatter(x=curr_l_t.index, y=curr_l_t['Net_Real'], mode='lines', name=f'👁️預覽: {custom_name} (質押 {leverage_pct}%)', line=dict(width=3, color='#E74C3C')))
             st.plotly_chart(fig_traj, use_container_width=True)
+
+            # --- V9.1 補回的壓力測試圖區塊 ---
+            st.subheader("🚨 質押維持率壓力監測競技場")
+            fig_margin = go.Figure()
+            has_margin_data = False
+            
+            for strat in st.session_state.saved_portfolios:
+                if strat.get('leverage_pct', 0) > 0 and 'computed_traj' in strat:
+                    name = strat['name']
+                    traj = strat['computed_traj']
+                    plot_margin = traj['Maintenance_Margin'].replace([np.inf, -np.inf], 1000).clip(upper=1000)
+                    fig_margin.add_trace(go.Scatter(x=traj.index, y=plot_margin, mode='lines', name=name, line=dict(width=1.5)))
+                    has_margin_data = True
+
+            if leverage_pct > 0:
+                plot_margin = curr_l_t['Maintenance_Margin'].replace([np.inf, -np.inf], 1000).clip(upper=1000)
+                fig_margin.add_trace(go.Scatter(x=curr_l_t.index, y=plot_margin, mode='lines', name=f'👁️預覽: {custom_name} (質押 {leverage_pct}%)', line=dict(width=3, color='#F1C40F')))
+                has_margin_data = True
+                
+                target_margin_show = ((1 + leverage_pct/100) / (leverage_pct/100) * 100)
+                if enable_rebalance:
+                    fig_margin.add_hline(y=target_margin_show, line_dash="dash", line_color="green", annotation_text=f"預覽恆定目標線 ({target_margin_show:.0f}%)", annotation_position="top left")
+
+            if has_margin_data:
+                fig_margin.add_hline(y=166, line_dash="dash", line_color="orange", annotation_text="166% (追繳線)", annotation_position="bottom right")
+                fig_margin.add_hline(y=130, line_dash="solid", line_color="red", annotation_text="130% (斷頭線)", annotation_position="bottom right")
+                fig_margin.update_layout(hovermode="x unified", yaxis_title="維持率 (%)", yaxis=dict(range=[100, 1000]))
+                st.plotly_chart(fig_margin, use_container_width=True, key="margin_chart_main")
+            else:
+                st.info("目前清單中沒有包含質押槓桿的策略，無維持率風險。")
+            # ----------------------------------
 
             st.divider()
             st.subheader("🎯 系統判斷與最佳化配比建議 (AI 動態尋優)")
