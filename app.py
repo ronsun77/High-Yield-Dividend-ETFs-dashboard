@@ -30,7 +30,7 @@ DEFAULT_ETF_DICT = {
 }
 
 # ==========================================
-# 2. 資料抓取與輔助運算引擎
+# 2. 資料抓取與嚴格對齊引擎
 # ==========================================
 @st.cache_data(ttl=3600)
 def load_raw_data(tickers, start_date, end_date):
@@ -59,7 +59,9 @@ def load_raw_data(tickers, start_date, end_date):
         except Exception:
             continue
             
-    return pd.DataFrame(raw_prices).dropna(how='all').ffill().bfill(), div_raw_dict
+    # 🚀 V7.0 終極防線：嚴格執行 dropna() 交集對齊，徹底拔除會導致時光機作弊的 bfill()！
+    aligned_df = pd.DataFrame(raw_prices).ffill().dropna()
+    return aligned_df, div_raw_dict
 
 def get_beta_and_market_mdd(tickers, weights, df_price, market_ticker='^TWII'):
     if market_ticker not in df_price.columns: return 1.0, 0.0
@@ -711,12 +713,11 @@ if selected_names:
                     best_mdd_list = []
                     best_net_list = []
                     
-                    # 測試網格：廣泛的維持率，包含允許以債養債的高維持率
                     test_margins = [150, 200, 250, 300, 350, 400, 450, 500, 600, 800, 1000]
                     valid_margins = [m for m in test_margins if m >= ai_min_margin]
                     
                     test_levs = [100 / (m/100 - 1) for m in valid_margins]
-                    test_levs.append(0) # 測試無質押
+                    test_levs.append(0)
                     test_levs = list(set(test_levs)) 
                     
                     for w in weight_grids:
@@ -726,10 +727,8 @@ if selected_names:
                         for lev in test_levs:
                             margin_target = ((1 + lev/100) / (lev/100)) * 100 if lev > 0 else float('inf')
                             
-                            # 跑動態歷史回測
                             _, _, raw = run_simulation(df_price[selected_tickers], div_raw_dict, w, initial_capital, lev, borrow_rate, annual_expense, True, margin_target)
                             
-                            # ✨ 核心解放：不再要求首年現金流 > 0，只要歷史軌跡中沒死掉，而且最低維持率沒掉破你的底線，就錄取！
                             if raw['min_maintenance'] >= ai_min_margin and not raw['is_bankrupt']:
                                 w_str = " + ".join([f"{name[:5]} {w[i]*100:.0f}%" for i, name in enumerate(selected_names) if w[i] > 0])
                                 
