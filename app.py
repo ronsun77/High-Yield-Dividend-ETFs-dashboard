@@ -30,7 +30,7 @@ DEFAULT_ETF_DICT = {
 }
 
 # ==========================================
-# 2. 資料抓取與嚴格對齊引擎
+# 2. 資料抓取與輔助運算引擎
 # ==========================================
 @st.cache_data(ttl=3600)
 def load_raw_data(tickers, start_date, end_date):
@@ -59,10 +59,7 @@ def load_raw_data(tickers, start_date, end_date):
         except Exception:
             continue
             
-    # 核心修復：只使用 ffill 填補中間的交易日落差，嚴禁使用 bfill 創造假數據！
-    # 接著使用 dropna() 確保所有欄位都有資料，強制對齊最晚上市的 ETF。
-    aligned_df = pd.DataFrame(raw_prices).ffill().dropna()
-    return aligned_df, div_raw_dict
+    return pd.DataFrame(raw_prices).dropna(how='all').ffill().bfill(), div_raw_dict
 
 def get_beta_and_market_mdd(tickers, weights, df_price, market_ticker='^TWII'):
     if market_ticker not in df_price.columns: return 1.0, 0.0
@@ -168,7 +165,7 @@ def generate_weight_combinations(num_assets, step_pct=10):
     return res
 
 # ==========================================
-# 3. 真實 BBD 提領模擬器 
+# 3. 真實 BBD 提領模擬器
 # ==========================================
 def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pct, borrow_rate, annual_expense, enable_rebalance, target_margin_input=None):
     lev_ratio = leverage_pct / 100.0
@@ -192,6 +189,7 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
     
     shares_real = {t: (total_initial_assets * adj_weights[i]) / df_price[t].iloc[0] for i, t in enumerate(tickers)}
     debt_real = initial_debt
+    
     shares_static = shares_real.copy()
     
     yearly_expense_accrued = 0
@@ -376,7 +374,7 @@ with st.sidebar:
                 st.session_state.custom_etfs[display_name] = ticker_symbol
                 st.rerun()
                 
-    selected_names = st.multiselect("選擇組成 ETF", list(current_etf_dict.keys()), default=["00713 元大台灣高息低波", "0050 元大台灣50", "006208 富邦台50"])
+    selected_names = st.multiselect("選擇組成 ETF", list(current_etf_dict.keys()), default=["00713 元大台灣高息低波", "0050 元大台灣50"])
     weights = []
     if selected_names:
         default_w = 100 // len(selected_names)
@@ -392,7 +390,7 @@ with st.sidebar:
         leverage_pct = st.slider("質押借款比例 (%)", 0, 100, 20)
         target_margin = ((1 + leverage_pct/100) / (leverage_pct/100) * 100) if leverage_pct > 0 else float('inf')
     else:
-        target_margin = st.number_input("目標初始維持率 (%)", min_value=130, max_value=1000, value=450, step=10)
+        target_margin = st.number_input("目標初始維持率 (%)", min_value=130, max_value=1000, value=600, step=10)
         leverage_pct = round(100 / (target_margin/100 - 1)) if target_margin > 100 else 0
         st.caption(f"推算需借款比例約為: {leverage_pct}%")
     borrow_rate = st.number_input("借款年利率 (%)", value=2.5, step=0.1) / 100.0
@@ -401,7 +399,7 @@ with st.sidebar:
 
     st.divider()
     st.header("🎯 5. AI 尋優防禦底線設定")
-    ai_min_margin = st.number_input("股災最低容許維持率 (%)", min_value=140, max_value=500, value=350, step=10, help="歷史回測中若維持率跌破此數值，AI 將淘汰該策略。建議 >300% 以保證安穩好眠。")
+    ai_min_margin = st.number_input("股災最低容許維持率 (%)", min_value=140, max_value=800, value=350, step=10, help="歷史回測中若維持率跌破此數值，AI 將淘汰該策略。建議 >300% 以保證安穩好眠。")
 
 # ==========================================
 # 5. 主畫面運算與渲染
@@ -469,7 +467,7 @@ if selected_names:
                 if net_cash >= 0:
                     col4.metric("💰 年底可擴張買股餘額", f"+{net_cash/10000:.1f} 萬", "正向循環")
                 else:
-                    col4.metric("🩸 年底需再借款缺口", f"{net_cash/10000:.1f} 萬", "不賣股轉負債", delta_color="inverse")
+                    col4.metric("🩸 年底需再借款缺口", f"{net_cash/10000:.1f} 萬", "以債養債", delta_color="inverse")
             else:
                 est_div = initial_capital * raw_port_yield
                 net_cash = est_div - annual_expense
@@ -698,13 +696,13 @@ if selected_names:
                 st.info("目前清單中沒有包含質押槓桿的策略，無維持率風險。")
 
             # ==========================================
-            # 6. AI 權重與單一押注網格尋優 (導入現金流倒推法)
+            # 6. AI 權重與單一押注網格尋優 (解放剛性現金流，改以歷史動態存活為準)
             # ==========================================
             st.divider()
             st.subheader("🎯 系統判斷與最佳化配比建議 (AI 動態尋優)")
             
             if st.button("🚀 啟動 AI 智慧尋優矩陣運算", type="primary", use_container_width=True):
-                with st.spinner(f"AI 正在背景執行剛性現金流篩選與交叉比對 (防禦底線設定：{ai_min_margin}%)..."):
+                with st.spinner(f"AI 正在背景進行海量動態回測 (允許以債養債，防禦底線設定：{ai_min_margin}%)..."):
                     num_assets = len(selected_tickers)
                     step_pct = 10 if num_assets <= 3 else (20 if num_assets == 4 else 25)
                     weight_grids = generate_weight_combinations(num_assets, step_pct)
@@ -713,50 +711,46 @@ if selected_names:
                     best_mdd_list = []
                     best_net_list = []
                     
-                    C = initial_capital
-                    E = annual_expense
-                    R = borrow_rate
+                    # 測試網格：廣泛的維持率，包含允許以債養債的高維持率
+                    test_margins = [150, 200, 250, 300, 350, 400, 450, 500, 600, 800, 1000]
+                    valid_margins = [m for m in test_margins if m >= ai_min_margin]
+                    
+                    test_levs = [100 / (m/100 - 1) for m in valid_margins]
+                    test_levs.append(0) # 測試無質押
+                    test_levs = list(set(test_levs)) 
                     
                     for w in weight_grids:
                         grid_beta, _ = get_beta_and_market_mdd(selected_tickers, w, df_price)
                         _, _, _, y_raw = get_portfolio_yield_cv(selected_tickers, df_price, div_raw_dict, w, 0, borrow_rate)
-                        Y = y_raw
-                        
-                        if C * Y >= E:
-                            d_min = 0
-                            lev_min = 0
-                            margin_max = float('inf')
-                        else:
-                            if Y <= R: continue 
-                            d_min = (E - C * Y) / (Y - R)
-                            lev_min = (d_min / C) * 100
-                            margin_max = ((1 + lev_min/100) / (lev_min/100)) * 100
-                        
-                        test_margins = [250, 300, 350, 400, 450, 500, 600, 800]
-                        valid_margins = [m for m in test_margins if m >= ai_min_margin and m <= margin_max]
-                        
-                        if margin_max != float('inf') and margin_max >= ai_min_margin:
-                            if margin_max not in valid_margins: valid_margins.append(margin_max)
-                        
-                        test_levs = [0] if d_min == 0 else []
-                        for m in valid_margins: test_levs.append(100 / (m/100 - 1))
-                        test_levs = list(set(test_levs)) 
                         
                         for lev in test_levs:
                             margin_target = ((1 + lev/100) / (lev/100)) * 100 if lev > 0 else float('inf')
+                            
+                            # 跑動態歷史回測
                             _, _, raw = run_simulation(df_price[selected_tickers], div_raw_dict, w, initial_capital, lev, borrow_rate, annual_expense, True, margin_target)
                             
+                            # ✨ 核心解放：不再要求首年現金流 > 0，只要歷史軌跡中沒死掉，而且最低維持率沒掉破你的底線，就錄取！
                             if raw['min_maintenance'] >= ai_min_margin and not raw['is_bankrupt']:
                                 w_str = " + ".join([f"{name[:5]} {w[i]*100:.0f}%" for i, name in enumerate(selected_names) if w[i] > 0])
-                                est_div = (C * (1 + lev/100)) * Y
-                                est_int = (C * (lev/100)) * R
-                                net_cf = est_div - est_int - E
+                                
+                                est_div = (initial_capital * (1 + lev/100)) * y_raw
+                                est_int = (initial_capital * (lev/100)) * borrow_rate
+                                net_cf = est_div - est_int - annual_expense
+                                
                                 margin_display = f"{margin_target:.0f}%" if margin_target != float('inf') else "無質押"
                                 
                                 result = {
-                                    "w_str": w_str, "lev": lev, "margin": margin_target, "margin_display": margin_display,
-                                    "sharpe": raw['sharpe_real'], "mdd": raw['mdd'], "net": raw['final_net_real'],
-                                    "cagr": raw['cagr_real'], "min_margin": raw['min_maintenance'], "beta": grid_beta, "net_cf": net_cf
+                                    "w_str": w_str,
+                                    "lev": lev,
+                                    "margin": margin_target,
+                                    "margin_display": margin_display,
+                                    "sharpe": raw['sharpe_real'],
+                                    "mdd": raw['mdd'],
+                                    "net": raw['final_net_real'],
+                                    "cagr": raw['cagr_real'],
+                                    "min_margin": raw['min_maintenance'],
+                                    "beta": grid_beta,
+                                    "net_cf": net_cf
                                 }
                                 best_sharpe_list.append(result)
                                 best_mdd_list.append(result)
@@ -770,49 +764,58 @@ if selected_names:
                     
                     if best_sharpe_list:
                         col_opt1, col_opt2, col_opt3 = st.columns(3)
+                        
                         with col_opt1:
                             st.info("#### 🥇 綜合王者 (高夏普+低回撤)\n兼顧抗震防禦與穩定盈餘的完美平衡點：")
                             for i, res in enumerate(best_sharpe_list[:3]):
                                 rank = ["❶ 冠軍", "❷ 亞軍", "❸ 季軍"][i]
+                                cf_color = "#E74C3C" if res['net_cf'] < 0 else "#2ECC71"
+                                cf_sign = "+" if res['net_cf'] > 0 else ""
                                 st.markdown(f"""
                                 <div style="font-size: 1.25em; line-height: 1.8; padding-bottom: 12px; margin-bottom: 12px; border-bottom: 1px solid #333;">
                                     <span style="font-size: 1.15em; font-weight: bold; color: #5DADE2;">{rank}：{res['w_str']}</span><br>
                                     • <b>組合 Beta：</b> {res['beta']:.2f}<br>
-                                    • <b>策略：</b> 恆定維持率 {res['margin_display']} <br> <span style="font-size: 0.9em; color: #AAB7B8;">(首年現金流餘額: +{res['net_cf']/10000:.1f} 萬)</span><br>
+                                    • <b>策略：</b> 恆定維持率 {res['margin_display']} <br> <span style="font-size: 0.9em; color: {cf_color};">(首年現金流估算: {cf_sign}{res['net_cf']/10000:.1f} 萬)</span><br>
                                     • <b>成效：</b> 真實夏普 {res['sharpe']:.2f} / 回撤 {res['mdd']*100:.2f}%<br>
                                     • 🛡️ <b>最低維持率：</b> {res['min_margin']:.0f}%
                                 </div>
                                 """, unsafe_allow_html=True)
+                        
                         with col_opt2:
                             st.warning("#### 🛡️ 絕對防禦 (最大回撤極小化)\n不盲目追求高報酬，以極致抗震、絕對存活為首要目標：")
                             for i, res in enumerate(best_mdd_list[:3]):
                                 rank = ["❶ 冠軍", "❷ 亞軍", "❸ 季軍"][i]
+                                cf_color = "#E74C3C" if res['net_cf'] < 0 else "#2ECC71"
+                                cf_sign = "+" if res['net_cf'] > 0 else ""
                                 st.markdown(f"""
                                 <div style="font-size: 1.25em; line-height: 1.8; padding-bottom: 12px; margin-bottom: 12px; border-bottom: 1px solid #333;">
                                     <span style="font-size: 1.15em; font-weight: bold; color: #F4D03F;">{rank}：{res['w_str']}</span><br>
                                     • <b>組合 Beta：</b> {res['beta']:.2f}<br>
-                                    • <b>策略：</b> 恆定維持率 {res['margin_display']} <br> <span style="font-size: 0.9em; color: #AAB7B8;">(首年現金流餘額: +{res['net_cf']/10000:.1f} 萬)</span><br>
+                                    • <b>策略：</b> 恆定維持率 {res['margin_display']} <br> <span style="font-size: 0.9em; color: {cf_color};">(首年現金流估算: {cf_sign}{res['net_cf']/10000:.1f} 萬)</span><br>
                                     • <b>成效：</b> 極限回撤 {res['mdd']*100:.2f}% / 真實夏普 {res['sharpe']:.2f}<br>
                                     • 🛡️ <b>最低維持率：</b> {res['min_margin']:.0f}%
                                 </div>
                                 """, unsafe_allow_html=True)
+                        
                         with col_opt3:
-                            st.error("#### 🚀 暴力擴張 (期末資產最大化)\n在保證「現金流大於零」的前提下，榨出最高絕對財富：")
+                            st.error("#### 🚀 暴力擴張 (期末資產最大化)\n只要扛得住波動，就利用借貸擴張榨出最高絕對財富：")
                             for i, res in enumerate(best_net_list[:3]):
                                 rank = ["❶ 冠軍", "❷ 亞軍", "❸ 季軍"][i]
+                                cf_color = "#E74C3C" if res['net_cf'] < 0 else "#2ECC71"
+                                cf_sign = "+" if res['net_cf'] > 0 else ""
                                 st.markdown(f"""
                                 <div style="font-size: 1.25em; line-height: 1.8; padding-bottom: 12px; margin-bottom: 12px; border-bottom: 1px solid #333;">
                                     <span style="font-size: 1.15em; font-weight: bold; color: #EC7063;">{rank}：{res['w_str']}</span><br>
                                     • <b>組合 Beta：</b> {res['beta']:.2f}<br>
-                                    • <b>策略：</b> 恆定維持率 {res['margin_display']} <br> <span style="font-size: 0.9em; color: #AAB7B8;">(首年現金流餘額: +{res['net_cf']/10000:.1f} 萬)</span><br>
+                                    • <b>策略：</b> 恆定維持率 {res['margin_display']} <br> <span style="font-size: 0.9em; color: {cf_color};">(首年現金流估算: {cf_sign}{res['net_cf']/10000:.1f} 萬)</span><br>
                                     • <b>成效：</b> 期末淨資產 {res['net']/10000:.0f} 萬 / 年化 {res['cagr']*100:.2f}%<br>
                                     • 🛡️ <b>最低維持率：</b> {res['min_margin']:.0f}%
                                 </div>
                                 """, unsafe_allow_html=True)
                     else:
-                        st.info(f"在目前的提領壓力與防禦底線 ({ai_min_margin}%) 下，系統無法找到保證開局損平且絕對存活的組合。建議調高本金、降低提領金額或調降防禦底線標準。")
+                        st.info(f"在目前的提領壓力與防禦底線 ({ai_min_margin}%) 下，系統無法找到保證不破產的組合。建議調高本金、降低提領金額或調降防禦底線標準。")
             else:
-                st.info("💡 調整完左側參數或 ETF 權重後，點擊上方按鈕即可啟動「剛性現金流篩選」多目標 AI 尋優計算。")
+                st.info("💡 調整完左側參數或 ETF 權重後，點擊上方按鈕即可啟動「動態回測」多目標 AI 尋優計算。")
 
         else:
             st.warning("資料獲取失敗，請確認時間區間內是否有足夠報價。")
