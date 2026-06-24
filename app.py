@@ -19,7 +19,6 @@ elif len(st.session_state.saved_portfolios) > 0 and 'tickers' not in st.session_
 if 'custom_etfs' not in st.session_state:
     st.session_state.custom_etfs = {}
 
-# 預設加入 0050 和 006208
 DEFAULT_ETF_DICT = {
     "0050 元大台灣50": "0050.TW",
     "0056 元大高股息": "0056.TW",
@@ -31,7 +30,7 @@ DEFAULT_ETF_DICT = {
 }
 
 # ==========================================
-# 2. 資料抓取與輔助運算引擎
+# 2. 資料抓取與嚴格對齊引擎
 # ==========================================
 @st.cache_data(ttl=3600)
 def load_raw_data(tickers, start_date, end_date):
@@ -60,27 +59,24 @@ def load_raw_data(tickers, start_date, end_date):
         except Exception:
             continue
             
-    return pd.DataFrame(raw_prices).dropna(how='all').ffill().bfill(), div_raw_dict
+    # 核心修復：只使用 ffill 填補中間的交易日落差，嚴禁使用 bfill 創造假數據！
+    # 接著使用 dropna() 確保所有欄位都有資料，強制對齊最晚上市的 ETF。
+    aligned_df = pd.DataFrame(raw_prices).ffill().dropna()
+    return aligned_df, div_raw_dict
 
 def get_beta_and_market_mdd(tickers, weights, df_price, market_ticker='^TWII'):
-    if market_ticker not in df_price.columns:
-        return 1.0, 0.0
-        
+    if market_ticker not in df_price.columns: return 1.0, 0.0
     valid_tickers = [t for t in tickers if t in df_price.columns]
-    if not valid_tickers:
-        return 1.0, 0.0
+    if not valid_tickers: return 1.0, 0.0
         
-    # 確保只拿有資料的日期來算 Beta
     aligned_df = df_price[valid_tickers + [market_ticker]].dropna()
-    if aligned_df.empty or len(aligned_df) < 2: 
-        return 1.0, 0.0
+    if aligned_df.empty or len(aligned_df) < 2: return 1.0, 0.0
         
     returns = aligned_df.pct_change().dropna()
     
     adj_weights = []
     for i, t in enumerate(tickers):
-        if t in valid_tickers:
-            adj_weights.append(weights[i])
+        if t in valid_tickers: adj_weights.append(weights[i])
     sum_w = sum(adj_weights)
     if sum_w == 0: return 1.0, 0.0
     adj_weights = [w/sum_w for w in adj_weights]
@@ -124,19 +120,15 @@ def get_portfolio_yield_cv(tickers, df_price, div_raw_dict, weights, leverage_pc
         divs = div_raw_dict.get(t, pd.Series(dtype=float))
         if not divs.empty:
             annual_divs = divs.groupby(divs.index.year).sum()
-            # 確保不會抓到 df_price 裡沒有的 ticker
             if t in df_price.columns:
                 y_yields = [d / df_price[t][df_price[t].index.year == y].mean() for y, d in annual_divs.items() if not df_price[t][df_price[t].index.year == y].empty]
                 avg_yield = np.mean(y_yields) if y_yields else 0.0
                 base_yields.append(avg_yield * weights[i])
             else:
                 base_yields.append(0.0)
-            
             annual = divs.groupby(divs.index.year).sum() * weights[i]
-            if port_annual_divs.empty:
-                port_annual_divs = annual
-            else:
-                port_annual_divs = port_annual_divs.add(annual, fill_value=0)
+            if port_annual_divs.empty: port_annual_divs = annual
+            else: port_annual_divs = port_annual_divs.add(annual, fill_value=0)
         else:
             base_yields.append(0.0)
             
@@ -172,12 +164,11 @@ def generate_weight_combinations(num_assets, step_pct=10):
             return temp_res
         combinations = helper(num_assets, 1.0)
         for combo in combinations:
-            if combo not in res:
-                res.append(combo)
+            if combo not in res: res.append(combo)
     return res
 
 # ==========================================
-# 3. 真實 BBD 提領模擬器 (加入破產判定)
+# 3. 真實 BBD 提領模擬器 
 # ==========================================
 def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pct, borrow_rate, annual_expense, enable_rebalance, target_margin_input=None):
     lev_ratio = leverage_pct / 100.0
@@ -191,21 +182,16 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
     else:
         target_margin_ratio = (total_initial_assets / initial_debt) if initial_debt > 0 else float('inf')
     
-    # 過濾出真的有在資料表裡的 tickers
     tickers = [c for c in df_price.columns if c != '^TWII']
-    # 對應權重也要處理防呆
     adj_weights = []
     for i, t in enumerate(df_price.columns):
-         if t != '^TWII':
-             # 簡單處理，如果傳進來的 weights 少於 tickers，補 0
-             adj_weights.append(weights[i] if i < len(weights) else 0)
+         if t != '^TWII': adj_weights.append(weights[i] if i < len(weights) else 0)
     
     shares_theory = {t: (total_initial_assets * adj_weights[i]) / df_price[t].iloc[0] for i, t in enumerate(tickers)}
     debt_theory = initial_debt
     
     shares_real = {t: (total_initial_assets * adj_weights[i]) / df_price[t].iloc[0] for i, t in enumerate(tickers)}
     debt_real = initial_debt
-    
     shares_static = shares_real.copy()
     
     yearly_expense_accrued = 0
@@ -214,29 +200,22 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
     
     trajectory = []
     current_year = -1
-    is_bankrupt = False # 破產標記
+    is_bankrupt = False 
     
     for date, prices in df_price.iterrows():
-        # 如果已經破產，淨資產鎖定為 0，不再產生任何現金流或利息
         if is_bankrupt:
             val_theory = sum([shares_theory[t] * prices[t] for t in tickers])
             debt_theory += debt_theory * daily_borrow_rate
             val_static = sum([shares_static[t] * prices[t] for t in tickers])
-            
-            # 理論含息持續滾動 (作為對照)
             for t in tickers:
                 divs = div_raw_dict.get(t, pd.Series(dtype=float))
                 if date in divs.index:
                     div_amount = divs.loc[date]
                     if isinstance(div_amount, pd.Series): div_amount = div_amount.iloc[0]
                     shares_theory[t] += (shares_theory[t] * div_amount) / prices[t]
-            
             trajectory.append({
-                'Date': date, 
-                'Net_Theory': val_theory - debt_theory,
-                'Net_Real': 0.0,
-                'Net_Static': val_static - initial_debt,
-                'Maintenance_Margin': float('inf') if leverage_pct == 0 else 0.0
+                'Date': date, 'Net_Theory': val_theory - debt_theory, 'Net_Real': 0.0,
+                'Net_Static': val_static - initial_debt, 'Maintenance_Margin': float('inf') if leverage_pct == 0 else 0.0
             })
             continue
 
@@ -266,7 +245,6 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
                     if leverage_pct > 0:
                         debt_real += shortfall
                     else:
-                        # 賣股求生
                         for i, t in enumerate(tickers):
                             sell_shares = (shortfall * adj_weights[i]) / prices[t]
                             shares_real[t] -= sell_shares
@@ -296,22 +274,14 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
         net_real = val_real + yearly_div_accrued - debt_real - yearly_interest_accrued - yearly_expense_accrued
         net_static = val_static - initial_debt
         
-        # 💀 破產判定器：真實淨資產跌破 0，宣告死亡
         if net_real <= 0:
             is_bankrupt = True
             net_real = 0.0
-            for t in tickers: shares_real[t] = 0 # 股票清零，不再產生利息與股息
+            for t in tickers: shares_real[t] = 0 
             debt_real = 0
             
         maintenance_margin = (val_real / debt_real * 100) if debt_real > 0 else float('inf')
-        
-        trajectory.append({
-            'Date': date, 
-            'Net_Theory': net_theory,
-            'Net_Real': net_real,
-            'Net_Static': net_static,
-            'Maintenance_Margin': maintenance_margin
-        })
+        trajectory.append({'Date': date, 'Net_Theory': net_theory, 'Net_Real': net_real, 'Net_Static': net_static, 'Maintenance_Margin': maintenance_margin})
         
     traj_df = pd.DataFrame(trajectory).set_index('Date')
     years = len(traj_df) / 252
@@ -320,7 +290,7 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
     cagr_static = (traj_df['Net_Static'].iloc[-1] / initial_capital) ** (1 / years) - 1 if years > 0 and traj_df['Net_Static'].iloc[-1] > 0 else 0
     
     if is_bankrupt:
-        cagr_real = -1.0 # -100% 破產
+        cagr_real = -1.0 
         sharpe_real = -9.99
         mdd = -1.0
         min_maintenance = 0.0
@@ -406,7 +376,6 @@ with st.sidebar:
                 st.session_state.custom_etfs[display_name] = ticker_symbol
                 st.rerun()
                 
-    # 預設加入 0050、006208 和 00713
     selected_names = st.multiselect("選擇組成 ETF", list(current_etf_dict.keys()), default=["00713 元大台灣高息低波", "0050 元大台灣50", "006208 富邦台50"])
     weights = []
     if selected_names:
@@ -445,7 +414,7 @@ if selected_names:
         for strat in st.session_state.saved_portfolios:
             all_required_tickers.update(strat['tickers'])
             
-        with st.spinner("啟動 Buy Borrow Die 提領與擴張模擬引擎... (若調整參數覺得卡頓屬正常現象，因背景正在計算日級別回測)"):
+        with st.spinner("啟動嚴格同期對齊與提領模擬引擎... (確保各 ETF 面對完全相同的大盤環境)"):
             df_price, div_raw_dict = load_raw_data(list(all_required_tickers), start_date, end_date)
             
         if not df_price.empty:
@@ -539,7 +508,7 @@ if selected_names:
                     st.rerun() 
             st.divider()
 
-            st.subheader(f"📋 全境動態績效比較表 (同期基準: {actual_start} 至 {actual_end})")
+            st.subheader(f"📋 全境動態績效比較表 (嚴格同期基準: {actual_start} 至 {actual_end})")
             display_data = []
             
             for col in selected_tickers:
@@ -567,7 +536,6 @@ if selected_names:
                 s_tickers = strat['tickers']
                 s_weights = strat['weights']
                 
-                # 確保所有需要的 ticker 都有被抓下來
                 if all(t in df_price.columns for t in s_tickers):
                     m, t_df, _ = run_simulation(
                         df_price[s_tickers], div_raw_dict, s_weights, 
@@ -628,8 +596,7 @@ if selected_names:
                     bg_color, font_weight, color = "transparent", "normal", "#E0E0E0"
                     
                     is_dead = "💀 破產" in str(row['期末淨資產(萬)'])
-                    if is_dead:
-                        color = "#E74C3C" 
+                    if is_dead: color = "#E74C3C" 
                     
                     if str(index).startswith("👁️ 預覽"):
                         bg_color, font_weight = "#117A65", "bold"
@@ -642,8 +609,7 @@ if selected_names:
                     html += f"<td style='padding: 6px; text-align:left; color:{color}; font-weight:{font_weight};'>{index}</td>"
                     for item in row:
                         val_color = color
-                        if is_dead and item != "💀 破產歸零":
-                             val_color = "#922B21" 
+                        if is_dead and item != "💀 破產歸零": val_color = "#922B21" 
                         html += f"<td style='padding: 6px; text-align:center; color:{val_color}; font-weight:{font_weight};'>{item}</td>"
                     html += "</tr>"
                 html += "</table>"
@@ -761,8 +727,7 @@ if selected_names:
                             lev_min = 0
                             margin_max = float('inf')
                         else:
-                            if Y <= R:
-                                continue 
+                            if Y <= R: continue 
                             d_min = (E - C * Y) / (Y - R)
                             lev_min = (d_min / C) * 100
                             margin_max = ((1 + lev_min/100) / (lev_min/100)) * 100
@@ -771,41 +736,27 @@ if selected_names:
                         valid_margins = [m for m in test_margins if m >= ai_min_margin and m <= margin_max]
                         
                         if margin_max != float('inf') and margin_max >= ai_min_margin:
-                            if margin_max not in valid_margins:
-                                valid_margins.append(margin_max)
+                            if margin_max not in valid_margins: valid_margins.append(margin_max)
                         
                         test_levs = [0] if d_min == 0 else []
-                        for m in valid_margins:
-                            test_levs.append(100 / (m/100 - 1))
-                            
+                        for m in valid_margins: test_levs.append(100 / (m/100 - 1))
                         test_levs = list(set(test_levs)) 
                         
                         for lev in test_levs:
                             margin_target = ((1 + lev/100) / (lev/100)) * 100 if lev > 0 else float('inf')
-                            
                             _, _, raw = run_simulation(df_price[selected_tickers], div_raw_dict, w, initial_capital, lev, borrow_rate, annual_expense, True, margin_target)
                             
                             if raw['min_maintenance'] >= ai_min_margin and not raw['is_bankrupt']:
                                 w_str = " + ".join([f"{name[:5]} {w[i]*100:.0f}%" for i, name in enumerate(selected_names) if w[i] > 0])
-                                
                                 est_div = (C * (1 + lev/100)) * Y
                                 est_int = (C * (lev/100)) * R
                                 net_cf = est_div - est_int - E
-                                
                                 margin_display = f"{margin_target:.0f}%" if margin_target != float('inf') else "無質押"
                                 
                                 result = {
-                                    "w_str": w_str,
-                                    "lev": lev,
-                                    "margin": margin_target,
-                                    "margin_display": margin_display,
-                                    "sharpe": raw['sharpe_real'],
-                                    "mdd": raw['mdd'],
-                                    "net": raw['final_net_real'],
-                                    "cagr": raw['cagr_real'],
-                                    "min_margin": raw['min_maintenance'],
-                                    "beta": grid_beta,
-                                    "net_cf": net_cf
+                                    "w_str": w_str, "lev": lev, "margin": margin_target, "margin_display": margin_display,
+                                    "sharpe": raw['sharpe_real'], "mdd": raw['mdd'], "net": raw['final_net_real'],
+                                    "cagr": raw['cagr_real'], "min_margin": raw['min_maintenance'], "beta": grid_beta, "net_cf": net_cf
                                 }
                                 best_sharpe_list.append(result)
                                 best_mdd_list.append(result)
@@ -815,11 +766,10 @@ if selected_names:
                     best_mdd_list.sort(key=lambda x: x['mdd'], reverse=True) 
                     best_net_list.sort(key=lambda x: x['net'], reverse=True)
                     
-                    st.success(f"📊 **網格搜索完成！同期間基準：{actual_start} 至 {actual_end}** (大盤最大回撤: {market_mdd*100:.2f}%)")
+                    st.success(f"📊 **網格搜索完成！嚴格同期基準：{actual_start} 至 {actual_end}** (大盤最大回撤: {market_mdd*100:.2f}%)")
                     
                     if best_sharpe_list:
                         col_opt1, col_opt2, col_opt3 = st.columns(3)
-                        
                         with col_opt1:
                             st.info("#### 🥇 綜合王者 (高夏普+低回撤)\n兼顧抗震防禦與穩定盈餘的完美平衡點：")
                             for i, res in enumerate(best_sharpe_list[:3]):
@@ -833,7 +783,6 @@ if selected_names:
                                     • 🛡️ <b>最低維持率：</b> {res['min_margin']:.0f}%
                                 </div>
                                 """, unsafe_allow_html=True)
-                        
                         with col_opt2:
                             st.warning("#### 🛡️ 絕對防禦 (最大回撤極小化)\n不盲目追求高報酬，以極致抗震、絕對存活為首要目標：")
                             for i, res in enumerate(best_mdd_list[:3]):
@@ -847,7 +796,6 @@ if selected_names:
                                     • 🛡️ <b>最低維持率：</b> {res['min_margin']:.0f}%
                                 </div>
                                 """, unsafe_allow_html=True)
-                        
                         with col_opt3:
                             st.error("#### 🚀 暴力擴張 (期末資產最大化)\n在保證「現金流大於零」的前提下，榨出最高絕對財富：")
                             for i, res in enumerate(best_net_list[:3]):
