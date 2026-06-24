@@ -19,10 +19,11 @@ elif len(st.session_state.saved_portfolios) > 0 and 'tickers' not in st.session_
 if 'custom_etfs' not in st.session_state:
     st.session_state.custom_etfs = {}
 
-# 預設加入 0050
+# 預設加入 0050 和 006208
 DEFAULT_ETF_DICT = {
     "0050 元大台灣50": "0050.TW",
     "0056 元大高股息": "0056.TW",
+    "006208 富邦台50": "006208.TW",
     "00878 國泰永續高股息": "00878.TW",
     "00919 群益台灣精選高息": "00919.TW",
     "00929 復華台灣科技優息": "00929.TW",
@@ -69,6 +70,7 @@ def get_beta_and_market_mdd(tickers, weights, df_price, market_ticker='^TWII'):
     if not valid_tickers:
         return 1.0, 0.0
         
+    # 確保只拿有資料的日期來算 Beta
     aligned_df = df_price[valid_tickers + [market_ticker]].dropna()
     if aligned_df.empty or len(aligned_df) < 2: 
         return 1.0, 0.0
@@ -122,9 +124,13 @@ def get_portfolio_yield_cv(tickers, df_price, div_raw_dict, weights, leverage_pc
         divs = div_raw_dict.get(t, pd.Series(dtype=float))
         if not divs.empty:
             annual_divs = divs.groupby(divs.index.year).sum()
-            y_yields = [d / df_price[t][df_price[t].index.year == y].mean() for y, d in annual_divs.items() if not df_price[t][df_price[t].index.year == y].empty]
-            avg_yield = np.mean(y_yields) if y_yields else 0.0
-            base_yields.append(avg_yield * weights[i])
+            # 確保不會抓到 df_price 裡沒有的 ticker
+            if t in df_price.columns:
+                y_yields = [d / df_price[t][df_price[t].index.year == y].mean() for y, d in annual_divs.items() if not df_price[t][df_price[t].index.year == y].empty]
+                avg_yield = np.mean(y_yields) if y_yields else 0.0
+                base_yields.append(avg_yield * weights[i])
+            else:
+                base_yields.append(0.0)
             
             annual = divs.groupby(divs.index.year).sum() * weights[i]
             if port_annual_divs.empty:
@@ -185,12 +191,19 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
     else:
         target_margin_ratio = (total_initial_assets / initial_debt) if initial_debt > 0 else float('inf')
     
+    # 過濾出真的有在資料表裡的 tickers
     tickers = [c for c in df_price.columns if c != '^TWII']
+    # 對應權重也要處理防呆
+    adj_weights = []
+    for i, t in enumerate(df_price.columns):
+         if t != '^TWII':
+             # 簡單處理，如果傳進來的 weights 少於 tickers，補 0
+             adj_weights.append(weights[i] if i < len(weights) else 0)
     
-    shares_theory = {t: (total_initial_assets * weights[i]) / df_price[t].iloc[0] for i, t in enumerate(tickers)}
+    shares_theory = {t: (total_initial_assets * adj_weights[i]) / df_price[t].iloc[0] for i, t in enumerate(tickers)}
     debt_theory = initial_debt
     
-    shares_real = {t: (total_initial_assets * weights[i]) / df_price[t].iloc[0] for i, t in enumerate(tickers)}
+    shares_real = {t: (total_initial_assets * adj_weights[i]) / df_price[t].iloc[0] for i, t in enumerate(tickers)}
     debt_real = initial_debt
     
     shares_static = shares_real.copy()
@@ -247,7 +260,7 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
                 
                 if net_cash > 0:
                     for i, t in enumerate(tickers):
-                        shares_real[t] += (net_cash * weights[i]) / prices[t]
+                        shares_real[t] += (net_cash * adj_weights[i]) / prices[t]
                 else:
                     shortfall = -net_cash
                     if leverage_pct > 0:
@@ -255,7 +268,7 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
                     else:
                         # 賣股求生
                         for i, t in enumerate(tickers):
-                            sell_shares = (shortfall * weights[i]) / prices[t]
+                            sell_shares = (shortfall * adj_weights[i]) / prices[t]
                             shares_real[t] -= sell_shares
 
                 if leverage_pct > 0 and enable_rebalance and target_margin_ratio != float('inf'):
@@ -267,7 +280,7 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
                             if delta_debt > 0:
                                 debt_real += delta_debt
                                 for i, t in enumerate(tickers):
-                                    shares_real[t] += (delta_debt * weights[i]) / prices[t]
+                                    shares_real[t] += (delta_debt * adj_weights[i]) / prices[t]
 
                 yearly_expense_accrued = 0
                 yearly_interest_accrued = 0
@@ -393,7 +406,8 @@ with st.sidebar:
                 st.session_state.custom_etfs[display_name] = ticker_symbol
                 st.rerun()
                 
-    selected_names = st.multiselect("選擇組成 ETF", list(current_etf_dict.keys()), default=["00713 元大台灣高息低波", "0056 元大高股息", "00878 國泰永續高股息", "0050 元大台灣50"])
+    # 預設加入 0050、006208 和 00713
+    selected_names = st.multiselect("選擇組成 ETF", list(current_etf_dict.keys()), default=["00713 元大台灣高息低波", "0050 元大台灣50", "006208 富邦台50"])
     weights = []
     if selected_names:
         default_w = 100 // len(selected_names)
@@ -431,7 +445,7 @@ if selected_names:
         for strat in st.session_state.saved_portfolios:
             all_required_tickers.update(strat['tickers'])
             
-        with st.spinner("啟動 Buy Borrow Die 提領與擴張模擬引擎..."):
+        with st.spinner("啟動 Buy Borrow Die 提領與擴張模擬引擎... (若調整參數覺得卡頓屬正常現象，因背景正在計算日級別回測)"):
             df_price, div_raw_dict = load_raw_data(list(all_required_tickers), start_date, end_date)
             
         if not df_price.empty:
@@ -553,6 +567,7 @@ if selected_names:
                 s_tickers = strat['tickers']
                 s_weights = strat['weights']
                 
+                # 確保所有需要的 ticker 都有被抓下來
                 if all(t in df_price.columns for t in s_tickers):
                     m, t_df, _ = run_simulation(
                         df_price[s_tickers], div_raw_dict, s_weights, 
@@ -612,10 +627,9 @@ if selected_names:
                 for index, row in df.iterrows():
                     bg_color, font_weight, color = "transparent", "normal", "#E0E0E0"
                     
-                    # 判斷是否破產並標記顏色
                     is_dead = "💀 破產" in str(row['期末淨資產(萬)'])
                     if is_dead:
-                        color = "#E74C3C" # 紅色警告
+                        color = "#E74C3C" 
                     
                     if str(index).startswith("👁️ 預覽"):
                         bg_color, font_weight = "#117A65", "bold"
@@ -629,7 +643,7 @@ if selected_names:
                     for item in row:
                         val_color = color
                         if is_dead and item != "💀 破產歸零":
-                             val_color = "#922B21" # 較暗的紅色顯示破產後的其他無效數據
+                             val_color = "#922B21" 
                         html += f"<td style='padding: 6px; text-align:center; color:{val_color}; font-weight:{font_weight};'>{item}</td>"
                     html += "</tr>"
                 html += "</table>"
