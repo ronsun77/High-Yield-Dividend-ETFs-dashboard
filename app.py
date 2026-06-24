@@ -57,13 +57,13 @@ def load_raw_data(tickers, start_date, end_date):
         except Exception:
             continue
             
-    return pd.DataFrame(raw_prices).dropna(), div_raw_dict
+    return pd.DataFrame(raw_prices).dropna(how='all').ffill().bfill(), div_raw_dict
 
 def get_beta_and_market_mdd(tickers, weights, df_price, market_ticker='^TWII'):
-    if market_ticker not in df_price.columns or not tickers:
+    # 防呆：確保大盤資料成功抓取
+    if market_ticker not in df_price.columns:
         return 1.0, 0.0
-    
-    # 防呆：過濾掉在 df_price 中找不到的 ticker
+        
     valid_tickers = [t for t in tickers if t in df_price.columns]
     if not valid_tickers:
         return 1.0, 0.0
@@ -72,16 +72,19 @@ def get_beta_and_market_mdd(tickers, weights, df_price, market_ticker='^TWII'):
     if aligned_df.empty or len(aligned_df) < 2: 
         return 1.0, 0.0
         
-    # 重新對應權重 (確保維度一致)
-    valid_weights = [weights[tickers.index(t)] for t in valid_tickers]
-    total_w = sum(valid_weights)
-    if total_w > 0:
-        valid_weights = [w / total_w for w in valid_weights]
-    else:
-        valid_weights = [1.0 / len(valid_tickers)] * len(valid_tickers)
-        
     returns = aligned_df.pct_change().dropna()
-    port_returns = returns[valid_tickers].dot(valid_weights)
+    
+    # 確保權重與有效 ticker 對齊
+    adj_weights = []
+    for i, t in enumerate(tickers):
+        if t in valid_tickers:
+            adj_weights.append(weights[i])
+    # 權重正規化
+    sum_w = sum(adj_weights)
+    if sum_w == 0: return 1.0, 0.0
+    adj_weights = [w/sum_w for w in adj_weights]
+            
+    port_returns = returns[valid_tickers].dot(adj_weights)
     market_returns = returns[market_ticker]
     
     cov_matrix = np.cov(port_returns, market_returns)
@@ -118,7 +121,7 @@ def get_portfolio_yield_cv(tickers, df_price, div_raw_dict, weights, leverage_pc
     
     for i, t in enumerate(tickers):
         divs = div_raw_dict.get(t, pd.Series(dtype=float))
-        if not divs.empty and t in df_price.columns:
+        if not divs.empty:
             annual_divs = divs.groupby(divs.index.year).sum()
             y_yields = [d / df_price[t][df_price[t].index.year == y].mean() for y, d in annual_divs.items() if not df_price[t][df_price[t].index.year == y].empty]
             avg_yield = np.mean(y_yields) if y_yields else 0.0
@@ -140,6 +143,7 @@ def get_portfolio_yield_cv(tickers, df_price, div_raw_dict, weights, leverage_pc
     lev_str = f"{lev_yield * 100:.2f}"
     
     cv_str = "-"
+    # 修復 SyntaxError
     if not port_annual_divs.empty and len(port_annual_divs[port_annual_divs > 0]) >= 2:
         valid = port_annual_divs[port_annual_divs > 0]
         cv_str = f"{valid.std() / valid.mean():.2f}"
@@ -327,13 +331,21 @@ with st.sidebar:
     
     st.header("⚖️ 3. 資產與權重")
     current_etf_dict = {**DEFAULT_ETF_DICT, **st.session_state.custom_etfs}
-    with st.expander("➕ 新增自訂 ETF"):
-        new_etf_code = st.text_input("輸入台股代碼 (例: 006208)")
-        new_etf_name = st.text_input("輸入顯示名稱 (例: 006208 富邦台50)")
-        if st.button("新增標的"):
-            if new_etf_code and new_etf_name:
-                ticker_symbol = f"{new_etf_code}.TW" if not new_etf_code.endswith(".TW") else new_etf_code
-                st.session_state.custom_etfs[new_etf_name] = ticker_symbol
+    
+    with st.expander("➕ 新增自訂 ETF", expanded=False):
+        new_etf_code = st.text_input("輸入台股代碼 (例: 0050)", help="輸入純代碼即可，系統會自動抓取名稱。")
+        if st.button("自動抓取並新增"):
+            if new_etf_code:
+                code_clean = new_etf_code.strip()
+                ticker_symbol = f"{code_clean}.TW" if code_clean.isdigit() else code_clean
+                with st.spinner("連線交易所抓取資料中..."):
+                    try:
+                        tk = yf.Ticker(ticker_symbol)
+                        name = tk.info.get('shortName', '')
+                        display_name = f"{code_clean} {name}" if name else code_clean
+                    except Exception:
+                        display_name = code_clean
+                st.session_state.custom_etfs[display_name] = ticker_symbol
                 st.rerun()
                 
     selected_names = st.multiselect("選擇組成 ETF", list(current_etf_dict.keys()), default=["00713 元大台灣高息低波", "0056 元大高股息", "00878 國泰永續高股息"])
@@ -352,12 +364,12 @@ with st.sidebar:
         leverage_pct = st.slider("質押借款比例 (%)", 0, 100, 20)
         target_margin = ((1 + leverage_pct/100) / (leverage_pct/100) * 100) if leverage_pct > 0 else float('inf')
     else:
-        target_margin = st.number_input("目標初始維持率 (%)", min_value=130, max_value=1000, value=166, step=10)
+        target_margin = st.number_input("目標初始維持率 (%)", min_value=130, max_value=1000, value=450, step=10)
         leverage_pct = round(100 / (target_margin/100 - 1)) if target_margin > 100 else 0
         st.caption(f"推算需借款比例約為: {leverage_pct}%")
     borrow_rate = st.number_input("借款年利率 (%)", value=2.5, step=0.1) / 100.0
     
-    enable_rebalance = st.checkbox("⚙️ 恆定維持率策略", value=False, help="每年底檢視：維持率超過設定值時，增加質押借款買入資產；低於設定值時，不做任何動作(絕不賣股)。")
+    enable_rebalance = st.checkbox("⚙️ 恆定維持率策略", value=True, help="每年底檢視：維持率超過設定值時，增加質押借款買入資產；低於設定值時，不做任何動作(絕不賣股)。")
 
     st.divider()
     st.header("🎯 5. AI 尋優防禦底線設定")
@@ -374,34 +386,14 @@ if selected_names:
         for strat in st.session_state.saved_portfolios:
             all_required_tickers.update(strat['tickers'])
             
-        with st.spinner("啟動 Buy Borrow Die 提領與擴張模擬引擎..."):
+        with st.spinner("啟動 Buy Borrow Die 提領與擴張模擬引擎... (若調整參數覺得卡頓屬正常現象，因背景正在計算日級別回測)"):
             df_price, div_raw_dict = load_raw_data(list(all_required_tickers), start_date, end_date)
             
         if not df_price.empty:
             actual_start = df_price.index[0].strftime('%Y-%m-%d')
             actual_end = df_price.index[-1].strftime('%Y-%m-%d')
             
-            # --- [修復 KeyError] 報價過濾防護網 ---
-            raw_selected = [current_etf_dict[name] for name in selected_names]
-            valid_selected = []
-            valid_weights = []
-            for t, w in zip(raw_selected, weights):
-                if t in df_price.columns:
-                    valid_selected.append(t)
-                    valid_weights.append(w)
-                    
-            if not valid_selected:
-                st.error("⚠️ 您選擇的所有標的皆無法從 Yahoo Finance 獲取報價，請檢查代碼或網路狀態。")
-                st.stop()
-                
-            if len(valid_selected) < len(raw_selected):
-                missing = set(raw_selected) - set(valid_selected)
-                st.warning(f"⚠️ 以下標的無法獲取報價，系統已暫時排除並重新分配權重：{', '.join(missing)}")
-                
-            selected_tickers = valid_selected
-            weights = [w / sum(valid_weights) for w in valid_weights]
-            # -------------------------------------
-            
+            selected_tickers = [current_etf_dict[name] for name in selected_names]
             port_beta, market_mdd = get_beta_and_market_mdd(selected_tickers, weights, df_price)
             port_yield_no_lev, port_yield_lev, port_cv, raw_port_yield = get_portfolio_yield_cv(selected_tickers, df_price, div_raw_dict, weights, leverage_pct, borrow_rate)
             
@@ -433,7 +425,7 @@ if selected_names:
                     * 總資產需有 **{breakeven_yield:.2f}%** 殖利率才能不傷本。
                     """)
                 else:
-                    st.info(f"無質押，無斷頭風險。\n* 目前組合 Beta值：{port_beta:.2f} (大盤連動度)")
+                    st.info(f"無質押，無斷頭風險。\n* 目前組合 Beta 值：{port_beta:.2f} (大盤連動度)")
 
             st.subheader(f"📊 預估首年現金流健康度 (以歷史平均殖利率估算)")
             if leverage_pct > 0:
@@ -550,12 +542,27 @@ if selected_names:
             comparison_df = pd.DataFrame(display_data).set_index("標的名稱")
             comparison_df = comparison_df[[c for c in ordered_cols if c in comparison_df.columns]]
             
+            TOOLTIPS = {
+                "組合 Beta": "此 ETF 組合相較於台股大盤的波動度 (低於 1 代表較抗跌)",
+                "恆定維持率": "是否開啟策略：維持率超標時自動借款買入資產",
+                "最低維持率": "評估抗斷頭能力。歷史回測中遭遇最差狀況時的維持率 (低於130%將斷頭)",
+                "期末淨資產(萬)": "已扣除此期間全部生活費、質押利息與剩餘負債後的真實身價",
+                "期末總資產(萬)": "期末淨資產 + 期末質押負債餘額 (亦已反映提領扣除)",
+                "理論含息年化(%)": "假設不提領生活費，配息100%全額再投入的極限報酬率",
+                "真實淨資產年化(%)": "BBD真實帳戶：扣生活費/利息，餘額買股、不足借款的淨身價成長率",
+                "單純價差年化(%)": "基準線：假設股數永遠不變(配息剛好抵銷提領)，單純由股價上漲的報酬",
+                "理論夏普值": "不考慮提領與借款利息，純粹資產本身的夏普值 (代表原始體質)",
+                "真實夏普值": "扣除生活費與利息後，真實 BBD 帳戶的夏普值",
+                "配息 CV": "變異係數 (標準差÷平均值)。越接近0代表歷年配息金額越平穩"
+            }
+            
             def render_html_table(df):
                 html = "<table style='width:100%; text-align:center; border-collapse: collapse; font-family: sans-serif; font-size: 0.85em;'>"
                 html += "<tr style='background-color: #1E1E1E; border-bottom: 2px solid #444;'>"
                 html += f"<th style='padding: 6px; text-align:left;'>標的名稱</th>"
                 for col in df.columns:
-                    html += f"<th style='padding: 6px; text-align:center;'>{col}</th>"
+                    tooltip = TOOLTIPS.get(col, "")
+                    html += f"<th style='padding: 6px; text-align:center;' title='{tooltip}'>{col}</th>"
                 html += "</tr>"
                 for index, row in df.iterrows():
                     bg_color, font_weight, color = "transparent", "normal", "#E0E0E0"
@@ -580,8 +587,10 @@ if selected_names:
                 * **最大回撤 (%)**：圖表上顯示的是**真實淨資產**的回撤。它包含了「ETF下跌 + 槓桿放大 + 提領抽血」的三重打擊，代表您帳戶真實經歷的最痛縮水幅度。
                 * **最低維持率**：遭遇歷史股災最差狀況時的維持率。小於 130% 代表策略失敗已遭券商斷頭。
                 * **真實淨資產年化 (%)**：**核心指標！** BBD 帳戶真實運作：自動扣除生活費/利息，餘額買股、不足借款的真實身價成長率。
+                * **理論含息年化 (%)**：代表該資產「原型（無槓桿、無提領）」的絕對極限報酬率，用來評估資產的原始體質。因此無論您的維持率或質押設定多少，此理論基準線都不會改變。
+                * **配息 CV (變異係數)**：衡量配息「穩定度」的科學指標 (配息標準差 ÷ 配息平均值)。
+                  * *為什麼不用單純的標準差？* 因為高殖利率 ETF 的平均配息金額本來就較高，直接看標準差會顯得波動大。CV 排除了「絕對金額大小」的影響，讓高息與低息 ETF 能在同一個基準上比較穩定度。數值越接近 0，代表相對於它自己的水平而言，配息越穩定。
                 * **理論夏普值** vs **真實夏普值**：前者代表資產原來的優劣；後者代表扛下提領壓力後，真實入袋的 CP 值。
-                * **配息 CV**：配息變異係數 (標準差÷平均值)。數值越接近 0，代表歷年配息金額越平穩，越不會引發意外的現金流斷層，是評估 BBD 核心資產的關鍵。
                 """)
 
             if st.session_state.saved_portfolios:
@@ -747,45 +756,42 @@ if selected_names:
                             for i, res in enumerate(best_sharpe_list[:3]):
                                 rank = ["❶ 冠軍", "❷ 亞軍", "❸ 季軍"][i]
                                 st.markdown(f"""
-                                <div style="font-size: 1.15em; line-height: 1.6; padding-bottom: 10px;">
-                                    <span style="font-size: 1.2em; font-weight: bold; color: #5DADE2;">{rank}：{res['w_str']}</span><br>
+                                <div style="font-size: 1.25em; line-height: 1.8; padding-bottom: 12px; margin-bottom: 12px; border-bottom: 1px solid #333;">
+                                    <span style="font-size: 1.15em; font-weight: bold; color: #5DADE2;">{rank}：{res['w_str']}</span><br>
                                     • <b>組合 Beta：</b> {res['beta']:.2f}<br>
                                     • <b>策略：</b> 恆定維持率 {res['margin_display']} <br> <span style="font-size: 0.9em; color: #AAB7B8;">(首年現金流餘額: +{res['net_cf']/10000:.1f} 萬)</span><br>
                                     • <b>成效：</b> 真實夏普 {res['sharpe']:.2f} / 回撤 {res['mdd']*100:.2f}%<br>
                                     • 🛡️ <b>最低維持率：</b> {res['min_margin']:.0f}%
                                 </div>
                                 """, unsafe_allow_html=True)
-                                if i < 2: st.markdown("---")
                         
                         with col_opt2:
                             st.warning("#### 🛡️ 絕對防禦 (最大回撤極小化)\n不盲目追求高報酬，以極致抗震、絕對存活為首要目標：")
                             for i, res in enumerate(best_mdd_list[:3]):
                                 rank = ["❶ 冠軍", "❷ 亞軍", "❸ 季軍"][i]
                                 st.markdown(f"""
-                                <div style="font-size: 1.15em; line-height: 1.6; padding-bottom: 10px;">
-                                    <span style="font-size: 1.2em; font-weight: bold; color: #F4D03F;">{rank}：{res['w_str']}</span><br>
+                                <div style="font-size: 1.25em; line-height: 1.8; padding-bottom: 12px; margin-bottom: 12px; border-bottom: 1px solid #333;">
+                                    <span style="font-size: 1.15em; font-weight: bold; color: #F4D03F;">{rank}：{res['w_str']}</span><br>
                                     • <b>組合 Beta：</b> {res['beta']:.2f}<br>
                                     • <b>策略：</b> 恆定維持率 {res['margin_display']} <br> <span style="font-size: 0.9em; color: #AAB7B8;">(首年現金流餘額: +{res['net_cf']/10000:.1f} 萬)</span><br>
                                     • <b>成效：</b> 極限回撤 {res['mdd']*100:.2f}% / 真實夏普 {res['sharpe']:.2f}<br>
                                     • 🛡️ <b>最低維持率：</b> {res['min_margin']:.0f}%
                                 </div>
                                 """, unsafe_allow_html=True)
-                                if i < 2: st.markdown("---")
                         
                         with col_opt3:
                             st.error("#### 🚀 暴力擴張 (期末資產最大化)\n在保證「現金流大於零」的前提下，榨出最高絕對財富：")
                             for i, res in enumerate(best_net_list[:3]):
                                 rank = ["❶ 冠軍", "❷ 亞軍", "❸ 季軍"][i]
                                 st.markdown(f"""
-                                <div style="font-size: 1.15em; line-height: 1.6; padding-bottom: 10px;">
-                                    <span style="font-size: 1.2em; font-weight: bold; color: #EC7063;">{rank}：{res['w_str']}</span><br>
+                                <div style="font-size: 1.25em; line-height: 1.8; padding-bottom: 12px; margin-bottom: 12px; border-bottom: 1px solid #333;">
+                                    <span style="font-size: 1.15em; font-weight: bold; color: #EC7063;">{rank}：{res['w_str']}</span><br>
                                     • <b>組合 Beta：</b> {res['beta']:.2f}<br>
                                     • <b>策略：</b> 恆定維持率 {res['margin_display']} <br> <span style="font-size: 0.9em; color: #AAB7B8;">(首年現金流餘額: +{res['net_cf']/10000:.1f} 萬)</span><br>
                                     • <b>成效：</b> 期末淨資產 {res['net']/10000:.0f} 萬 / 年化 {res['cagr']*100:.2f}%<br>
                                     • 🛡️ <b>最低維持率：</b> {res['min_margin']:.0f}%
                                 </div>
                                 """, unsafe_allow_html=True)
-                                if i < 2: st.markdown("---")
                     else:
                         st.info(f"在目前的提領壓力與防禦底線 ({ai_min_margin}%) 下，系統無法找到保證開局損平且絕對存活的組合。建議調高本金、降低提領金額或調降防禦底線標準。")
             else:
