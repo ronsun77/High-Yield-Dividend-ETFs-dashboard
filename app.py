@@ -19,7 +19,9 @@ elif len(st.session_state.saved_portfolios) > 0 and 'tickers' not in st.session_
 if 'custom_etfs' not in st.session_state:
     st.session_state.custom_etfs = {}
 
+# 預設加入 0050 元大台灣50
 DEFAULT_ETF_DICT = {
+    "0050 元大台灣50": "0050.TW",
     "0056 元大高股息": "0056.TW",
     "00878 國泰永續高股息": "00878.TW",
     "00919 群益台灣精選高息": "00919.TW",
@@ -60,7 +62,6 @@ def load_raw_data(tickers, start_date, end_date):
     return pd.DataFrame(raw_prices).dropna(how='all').ffill().bfill(), div_raw_dict
 
 def get_beta_and_market_mdd(tickers, weights, df_price, market_ticker='^TWII'):
-    # 防呆：確保大盤資料成功抓取
     if market_ticker not in df_price.columns:
         return 1.0, 0.0
         
@@ -74,12 +75,10 @@ def get_beta_and_market_mdd(tickers, weights, df_price, market_ticker='^TWII'):
         
     returns = aligned_df.pct_change().dropna()
     
-    # 確保權重與有效 ticker 對齊
     adj_weights = []
     for i, t in enumerate(tickers):
         if t in valid_tickers:
             adj_weights.append(weights[i])
-    # 權重正規化
     sum_w = sum(adj_weights)
     if sum_w == 0: return 1.0, 0.0
     adj_weights = [w/sum_w for w in adj_weights]
@@ -143,7 +142,6 @@ def get_portfolio_yield_cv(tickers, df_price, div_raw_dict, weights, leverage_pc
     lev_str = f"{lev_yield * 100:.2f}"
     
     cv_str = "-"
-    # 修復 SyntaxError
     if not port_annual_divs.empty and len(port_annual_divs[port_annual_divs > 0]) >= 2:
         valid = port_annual_divs[port_annual_divs > 0]
         cv_str = f"{valid.std() / valid.mean():.2f}"
@@ -333,22 +331,28 @@ with st.sidebar:
     current_etf_dict = {**DEFAULT_ETF_DICT, **st.session_state.custom_etfs}
     
     with st.expander("➕ 新增自訂 ETF", expanded=False):
-        new_etf_code = st.text_input("輸入台股代碼 (例: 0050)", help="輸入純代碼即可，系統會自動抓取名稱。")
-        if st.button("自動抓取並新增"):
+        new_etf_code = st.text_input("輸入台股代碼 (例: 006208)", help="輸入純代碼即可，系統會嘗試自動抓取名稱。如果抓不到英文，您依然可以自行在此下方修改。")
+        new_etf_name_override = st.text_input("自訂顯示名稱 (選填)")
+        if st.button("手動/自動新增標的"):
             if new_etf_code:
                 code_clean = new_etf_code.strip()
                 ticker_symbol = f"{code_clean}.TW" if code_clean.isdigit() else code_clean
-                with st.spinner("連線交易所抓取資料中..."):
-                    try:
-                        tk = yf.Ticker(ticker_symbol)
-                        name = tk.info.get('shortName', '')
-                        display_name = f"{code_clean} {name}" if name else code_clean
-                    except Exception:
-                        display_name = code_clean
+                display_name = new_etf_name_override if new_etf_name_override else code_clean
+                
+                if not new_etf_name_override:
+                    with st.spinner("連線交易所嘗試抓取資料中..."):
+                        try:
+                            tk = yf.Ticker(ticker_symbol)
+                            name = tk.info.get('shortName', '')
+                            # 如果抓到的還是很長的英文或空值，使用者下次也可以透過選填欄位手動覆蓋
+                            if name: display_name = f"{code_clean} {name}"
+                        except Exception:
+                            pass
                 st.session_state.custom_etfs[display_name] = ticker_symbol
                 st.rerun()
                 
-    selected_names = st.multiselect("選擇組成 ETF", list(current_etf_dict.keys()), default=["00713 元大台灣高息低波", "0056 元大高股息", "00878 國泰永續高股息"])
+    # 預設加入 0050
+    selected_names = st.multiselect("選擇組成 ETF", list(current_etf_dict.keys()), default=["00713 元大台灣高息低波", "0056 元大高股息", "00878 國泰永續高股息", "0050 元大台灣50"])
     weights = []
     if selected_names:
         default_w = 100 // len(selected_names)
