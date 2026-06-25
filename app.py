@@ -10,7 +10,16 @@ from datetime import datetime, timedelta
 # 1. 網頁設定 & 暫存初始化
 # ==========================================
 st.set_page_config(page_title="高股息策略與質押模擬器", layout="wide")
-st.title("🛡️ 台灣高股息 ETF 買借死 (BBD) 質押模擬器 V9.1")
+st.title("🛡️ 台灣高股息 ETF 買借死 (BBD) 質押模擬器 V9.2")
+
+with st.expander("📖 BBD 冬眠預備金動態防禦系統：五大運作鐵律 (點擊展開/收起)", expanded=True):
+    st.markdown("""
+    1. **開局儲備（冬眠機制）：** 系統開局會自動從總本金中鎖定 **N 年的生活費**作為「現金預備金」，此資金不投入股市、不計槓桿，專門用來擊碎退休前幾年大盤崩盤的「報酬順序風險 (SORR)」。
+    2. **剩餘資金入市與擴張：** 扣除預備金後的賸餘資金才進入股市建立核心資產，並依據指定的「目標初始維持率」精準推算質押成數，借款放大資產規模。
+    3. **股息自動回補幫浦：** 年底結算時，若「總股息收入」大於「生活費＋利息」，多出來的錢**優先存回現金預備金池**。直到預備金補滿水位，剩餘資金才啟動「再投入買股」進行資產複利。
+    4. **股災期間絕對不賣股：** 股息不夠付開銷時，**嚴禁在低檔變賣股票**。系統會優先抽血「現金預備金」補缺口；若預備金燒光，則自動動用剩餘的質押借款額度（以債養債）度過寒冬。
+    5. **嚴格同期對齊與防破產：** 所有資產強制採用無情交集對齊（以最晚上市的 ETF 為起跑線），杜絕假數據。一旦真實淨資產（股票市值＋預備金－質押負債）小於等於 0，系統立刻宣判破產。
+    """)
 
 if 'saved_portfolios' not in st.session_state:
     st.session_state.saved_portfolios = []
@@ -59,7 +68,6 @@ def load_raw_data(tickers, start_date, end_date):
         except Exception:
             continue
             
-    # 嚴格聯集對齊，拔除假數據
     aligned_df = pd.DataFrame(raw_prices).ffill().dropna()
     return aligned_df, div_raw_dict
 
@@ -167,7 +175,7 @@ def generate_weight_combinations(num_assets, step_pct=10):
     return res
 
 # ==========================================
-# 3. 真實 BBD 提領模擬器 (冬眠現金預備金保護機制)
+# 3. 真實 BBD 提領模擬器
 # ==========================================
 def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pct, borrow_rate, annual_expense, enable_rebalance, target_margin_input=None, reserve_years=2):
     lev_ratio = leverage_pct / 100.0
@@ -617,7 +625,6 @@ if selected_names:
                 fig_traj.add_trace(go.Scatter(x=curr_l_t.index, y=curr_l_t['Net_Real'], mode='lines', name=f'👁️預覽: {custom_name} (質押 {leverage_pct}%)', line=dict(width=3, color='#E74C3C')))
             st.plotly_chart(fig_traj, use_container_width=True)
 
-            # --- V9.1 補回的壓力測試圖區塊 ---
             st.subheader("🚨 質押維持率壓力監測競技場")
             fig_margin = go.Figure()
             has_margin_data = False
@@ -646,7 +653,6 @@ if selected_names:
                 st.plotly_chart(fig_margin, use_container_width=True, key="margin_chart_main")
             else:
                 st.info("目前清單中沒有包含質押槓桿的策略，無維持率風險。")
-            # ----------------------------------
 
             st.divider()
             st.subheader("🎯 系統判斷與最佳化配比建議 (AI 動態尋優)")
@@ -669,10 +675,15 @@ if selected_names:
                                 w_str = " + ".join([f"{name[:5]} {w[i]*100:.0f}%" for i, name in enumerate(selected_names) if w[i] > 0])
                                 invest_part = initial_capital - (annual_expense * reserve_years)
                                 net_cf = (invest_part * (1 + lev/100)) * y_raw - (invest_part * (lev/100)) * borrow_rate - annual_expense
+                                
+                                # ✨ 修復 inf% 顯示問題
+                                min_margin_str = "無質押" if raw['min_maintenance'] == float('inf') else f"{raw['min_maintenance']:.0f}%"
+                                margin_display = f"{margin_target:.0f}%" if margin_target != float('inf') else "無質押"
+                                
                                 result = {
-                                    "w_str": w_str, "margin_display": f"{margin_target:.0f}%" if margin_target != float('inf') else "無質押",
+                                    "w_str": w_str, "margin_display": margin_display,
                                     "sharpe": raw['sharpe_real'], "mdd": raw['mdd'], "net": raw['final_net_real'], "cagr": raw['cagr_real'],
-                                    "min_margin": raw['min_maintenance'], "beta": grid_beta, "net_cf": net_cf
+                                    "min_margin_str": min_margin_str, "beta": grid_beta, "net_cf": net_cf
                                 }
                                 best_sharpe_list.append(result)
                                 best_mdd_list.append(result)
@@ -694,7 +705,7 @@ if selected_names:
                                         <span style="font-weight: bold; color: {color};">{rank}：{res['w_str']}</span><br>
                                         • <b>策略：</b> 恆定維持率 {res['margin_display']}<br>
                                         • <b>真實夏普：</b> {res['sharpe']:.2f} / <b>最大回撤：</b> {res['mdd']*100:.2f}%<br>
-                                        • 🛡️ <b>最低維持率：</b> {res['min_margin']:.0f}%
+                                        • 🛡️ <b>最低維持率：</b> {res['min_margin_str']}
                                     </div>
                                     """, unsafe_allow_html=True)
                     else:
