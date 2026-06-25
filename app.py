@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 # 1. 網頁設定 & 暫存初始化
 # ==========================================
 st.set_page_config(page_title="高股息策略與質押模擬器", layout="wide")
-st.title("🛡️ 台灣高股息 ETF 買借死 (BBD) 質押模擬器 V9.2")
+st.title("🛡️ 台灣高股息 ETF 買借死 (BBD) 質押模擬器 V10.0")
 
 with st.expander("📖 BBD 冬眠預備金動態防禦系統：五大運作鐵律 (點擊展開/收起)", expanded=True):
     st.markdown("""
@@ -175,7 +175,7 @@ def generate_weight_combinations(num_assets, step_pct=10):
     return res
 
 # ==========================================
-# 3. 真實 BBD 提領模擬器
+# 3. 真實 BBD 提領模擬器 (加入歸因分析與破產年份)
 # ==========================================
 def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pct, borrow_rate, annual_expense, enable_rebalance, target_margin_input=None, reserve_years=2):
     lev_ratio = leverage_pct / 100.0
@@ -213,6 +213,8 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
     trajectory = []
     current_year = -1
     is_bankrupt = False 
+    bankrupt_year = None
+    margin_call_year = None
     
     for date, prices in df_price.iterrows():
         if is_bankrupt:
@@ -295,14 +297,21 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
         net_real = val_real + cash_real + yearly_div_accrued - debt_real - yearly_interest_accrued - yearly_expense_accrued
         net_static = val_static + initial_cash - initial_debt
         
-        if net_real <= 0:
+        maintenance_margin = (val_real / debt_real * 100) if debt_real > 0 else float('inf')
+        
+        # 紀錄斷頭年份 (若維持率小於 130%)
+        if leverage_pct > 0 and debt_real > 0 and maintenance_margin < 130 and margin_call_year is None:
+            margin_call_year = date.year
+            
+        if net_real <= 0 and not is_bankrupt:
             is_bankrupt = True
+            bankrupt_year = date.year
             net_real = 0.0
             for t in tickers: shares_real[t] = 0 
             debt_real = 0
             cash_real = 0
+            maintenance_margin = 0.0
             
-        maintenance_margin = (val_real / debt_real * 100) if debt_real > 0 else float('inf')
         trajectory.append({'Date': date, 'Net_Theory': net_theory, 'Net_Real': net_real, 'Net_Static': net_static, 'Maintenance_Margin': maintenance_margin})
         
     traj_df = pd.DataFrame(trajectory).set_index('Date')
@@ -311,13 +320,24 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
     cagr_theory = (traj_df['Net_Theory'].iloc[-1] / initial_capital) ** (1 / years) - 1 if years > 0 and traj_df['Net_Theory'].iloc[-1] > 0 else 0
     cagr_static = (traj_df['Net_Static'].iloc[-1] / initial_capital) ** (1 / years) - 1 if years > 0 and traj_df['Net_Static'].iloc[-1] > 0 else 0
     
+    # 計算最低維持率 (包含破產前的軌跡)
+    if leverage_pct > 0:
+        min_maintenance_series = traj_df['Maintenance_Margin'][traj_df['Maintenance_Margin'] > 0]
+        min_maintenance = min_maintenance_series.min() if not min_maintenance_series.empty else 0.0
+    else:
+        min_maintenance = float('inf')
+
     if is_bankrupt:
         cagr_real = -1.0 
         sharpe_real = -9.99
         mdd = -1.0
-        min_maintenance = 0.0
-        final_net_real_str = "💀 破產歸零"
+        final_net_real_str = f"💀 破產歸零 ({bankrupt_year}年)"
         final_total_assets_str = "-"
+        
+        if margin_call_year:
+            attribution = f"💀 {margin_call_year}年遭斷頭 (維持率低於130%)"
+        else:
+            attribution = f"💀 {bankrupt_year}年本金耗盡 (提領/利息重壓)"
     else:
         cagr_real = (traj_df['Net_Real'].iloc[-1] / initial_capital) ** (1 / years) - 1 if years > 0 and traj_df['Net_Real'].iloc[-1] > 0 else 0
         daily_ret_real = traj_df['Net_Real'].pct_change().dropna()
@@ -326,9 +346,23 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
         cum_real = traj_df['Net_Real'] / initial_capital
         running_max = cum_real.cummax()
         mdd = ((cum_real - running_max) / running_max).min() if not cum_real.empty else 0
-        min_maintenance = traj_df['Maintenance_Margin'].min() if leverage_pct > 0 else float('inf')
+        
         final_net_real_str = f"{traj_df['Net_Real'].iloc[-1] / 10000:.2f}"
         final_total_assets_str = f"{(traj_df['Net_Real'].iloc[-1] + debt_real) / 10000:.2f}"
+        
+        # 歸因診斷
+        if leverage_pct > 0:
+            if min_maintenance < 166:
+                attribution = "⚠️ 驚險存活 (曾跌破166%面臨追繳)"
+            elif cagr_real < 0:
+                attribution = "⚠️ 慢性失血 (利息與提領大於資產增長)"
+            else:
+                attribution = "✅ 成功擴張 (現金流正向循環)"
+        else:
+            if cagr_real < 0:
+                attribution = "⚠️ 慢性失血 (配息不足，被迫變賣本金)"
+            else:
+                attribution = "✅ 安穩存活 (股息與成長涵蓋提領)"
 
     daily_ret_theory = traj_df['Net_Theory'].pct_change().dropna()
     vol_theory = daily_ret_theory.std() * np.sqrt(252) if not daily_ret_theory.empty else 0
@@ -342,7 +376,8 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
         "mdd": mdd,
         "sharpe_real": sharpe_real,
         "min_maintenance": min_maintenance,
-        "is_bankrupt": is_bankrupt
+        "is_bankrupt": is_bankrupt,
+        "attribution": attribution
     }
     
     return {
@@ -357,7 +392,8 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
         "理論夏普值": f"{sharpe_theory:.2f}",
         "真實夏普值": f"{sharpe_real:.2f}" if not is_bankrupt else "-",
         "恆定維持率": rebalance_status,
-        "質押標籤": "質押" if leverage_pct > 0 else "原型" 
+        "質押標籤": "質押" if leverage_pct > 0 else "原型",
+        "歸因分析": attribution
     }, traj_df, raw_metrics
 
 # ==========================================
@@ -365,6 +401,7 @@ def run_simulation(df_price, div_raw_dict, weights, initial_capital, leverage_pc
 # ==========================================
 with st.sidebar:
     st.header("💰 1. 資金與提領設定 (全局連動)")
+    # 預設調整為 800萬本金 / 60萬生活費
     initial_capital = st.number_input("初始本金 (元)", value=8000000, step=1000000)
     annual_expense = st.number_input("每年生活費需求 (元)", value=600000, step=10000)
     reserve_years = st.number_input("冬眠現金預備金 (年)", value=2, min_value=0, max_value=10, help="保留 N 年的生活費作為現金緩衝，不投入股市。遇到股災時優先扣除此現金，絕對避免在低檔賣股。")
@@ -399,7 +436,7 @@ with st.sidebar:
                 st.session_state.custom_etfs[display_name] = ticker_symbol
                 st.rerun()
                 
-    # 預設連動 00713 / 0056 / 00878
+    # 預設組合：00713 / 0056 / 00878
     selected_names = st.multiselect("選擇組成 ETF", list(current_etf_dict.keys()), default=["00713 元大台灣高息低波", "0056 元大高股息", "00878 國泰永續高股息"])
     weights = []
     if selected_names:
@@ -416,6 +453,7 @@ with st.sidebar:
         leverage_pct = st.slider("質押借款比例 (%)", 0, 100, 20)
         target_margin = ((1 + leverage_pct/100) / (leverage_pct/100) * 100) if leverage_pct > 0 else float('inf')
     else:
+        # 預設維持率 450%
         target_margin = st.number_input("目標初始維持率 (%)", min_value=130, max_value=1000, value=450, step=10)
         leverage_pct = round(100 / (target_margin/100 - 1)) if target_margin > 100 else 0
         st.caption(f"推算需借款比例約為: {leverage_pct}%")
@@ -578,7 +616,7 @@ if selected_names:
                 curr_l_m.update({"標的名稱": f"👁️ 預覽: {custom_name} (質押)", "質押": f"{leverage_pct}%", "組合 Beta": f"{port_beta:.2f}", "恆定維持率": "開啟" if enable_rebalance else "關閉", "年化配息率(%)": port_yield_lev, "填息成功率": "-", "平均填息天數": "-", "配息 CV": port_cv})
                 display_data.append(curr_l_m)
                 
-            ordered_cols = ["標的名稱", "質押", "組合 Beta", "恆定維持率", "最低維持率", "期末淨資產(萬)", "期末總資產(萬)", "理論含息年化(%)", "真實淨資產年化(%)", "單純價差年化(%)", "年化配息率(%)", "填息成功率", "平均填息天數", "年化波動率(%)", "最大回撤(%)", "理論夏普值", "真實夏普值", "配息 CV"]
+            ordered_cols = ["標的名稱", "質押", "組合 Beta", "恆定維持率", "最低維持率", "期末淨資產(萬)", "期末總資產(萬)", "理論含息年化(%)", "真實淨資產年化(%)", "單純價差年化(%)", "年化配息率(%)", "填息成功率", "平均填息天數", "年化波動率(%)", "最大回撤(%)", "理論夏普值", "真實夏普值", "配息 CV", "歸因分析"]
             comparison_df = pd.DataFrame(display_data).set_index("標的名稱")
             comparison_df = comparison_df[[c for c in ordered_cols if c in comparison_df.columns]]
             
@@ -602,7 +640,7 @@ if selected_names:
                     html += f"<td style='padding: 6px; text-align:left; color:{color}; font-weight:{font_weight};'>{index}</td>"
                     for item in row:
                         val_color = color
-                        if is_dead and item != "💀 破產歸零": val_color = "#922B21" 
+                        if is_dead and "💀 破產" not in str(item) and "遭斷頭" not in str(item) and "本金耗盡" not in str(item): val_color = "#922B21" 
                         html += f"<td style='padding: 6px; text-align:center; color:{val_color}; font-weight:{font_weight};'>{item}</td>"
                     html += "</tr>"
                 html += "</table>"
@@ -676,7 +714,6 @@ if selected_names:
                                 invest_part = initial_capital - (annual_expense * reserve_years)
                                 net_cf = (invest_part * (1 + lev/100)) * y_raw - (invest_part * (lev/100)) * borrow_rate - annual_expense
                                 
-                                # ✨ 修復 inf% 顯示問題
                                 min_margin_str = "無質押" if raw['min_maintenance'] == float('inf') else f"{raw['min_maintenance']:.0f}%"
                                 margin_display = f"{margin_target:.0f}%" if margin_target != float('inf') else "無質押"
                                 
